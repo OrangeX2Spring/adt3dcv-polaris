@@ -211,3 +211,60 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Nested upstream Git metadata backups
+third_party/openpi/.git-upstream-backup/
+third_party/vjepa2/.git-upstream-backup/
+
+# Docker / Isaac local runtime files
+/.tmp/
+/.cache/
+/.venv/
+/.vscode/
+/last_frame.jpg
+/test.py
+
+# Downloaded environments and evaluation outputs
+/PolaRiS-Hub/
+/runs/
+
+# Nested Git metadata backups
+/third_party/openpi/.git-upstream-backup/
+/third_party/vjepa2/.git-upstream-backup/
+
+# Third-party local environments and artifacts
+/third_party/**/.venv/
+/third_party/**/.cache/
+/third_party/**/outputs/
+/third_party/**/runs/
+/third_party/**/eval_logs/
+/third_party/**/checkpoints/
+/third_party/**/pretrained_models/
+
+# Large ALOHA simulation asset from upstream
+third_party/openpi/third_party/aloha/aloha2/workcell_v2/Aloha workcell v2.stl
+
+# Nested upstream Git metadata
+third_party/openpi/third_party/aloha/.git-upstream-backup/
+third_party/openpi/third_party/libero/.git-upstream-backup/
+
+# Unused upstream OpenPI examples and optional repositories
+third_party/openpi/examples/aloha_real/
+third_party/openpi/examples/aloha_sim/
+third_party/openpi/third_party/aloha/
+third_party/openpi/third_party/libero/
+
+# Upstream Git metadata backups
+third_party/openpi/.git-upstream-backup/
+third_party/vjepa2/.git-upstream-backup/
+
+# OpenPI upstream metadata and unused examples
+third_party/openpi/.git-upstream-backup/
+third_party/vjepa2/.git-upstream-backup/
+third_party/openpi/third_party/aloha/
+third_party/openpi/third_party/libero/
+third_party/openpi/examples/aloha_real/
+third_party/openpi/examples/aloha_sim/
+third_party/openpi/examples/libero/
+third_party/openpi/.git-upstream-backup
+third_party/vjepa2/.git-upstream-backup
