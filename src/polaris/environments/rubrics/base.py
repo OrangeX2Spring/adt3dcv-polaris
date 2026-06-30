@@ -39,7 +39,7 @@ class Rubric:
     def _metric_prefix(idx: int, fn: Callable) -> str:
         name = getattr(fn, "_rubric_name", fn.__name__)
         name = re.sub(r"[^0-9a-zA-Z_]+", "_", name).strip("_")
-        return f"criterion_{idx}_{name}"
+        return f"c{idx}_{name}"
 
     def evaluate(self, env: ManagerBasedRLEnv) -> RubricResult:
         """
@@ -84,8 +84,8 @@ class Rubric:
 
         num_reached_ever = sum(self.criteria_reached)
         progress = num_reached_ever / num_criteria if num_criteria > 0 else 0.0
-        metrics["criteria_ever_reached"] = num_reached_ever
-        metrics["criteria_total"] = num_criteria
+        metrics["done"] = num_reached_ever
+        metrics["total"] = num_criteria
 
         success = num_reached_ever == num_criteria
         return RubricResult(success=success, progress=progress, metrics=metrics)

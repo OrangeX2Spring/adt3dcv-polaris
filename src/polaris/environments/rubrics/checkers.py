@@ -138,7 +138,7 @@ def is_within_xy(
         checker._last_metrics = metrics
         return False
 
-    checker._rubric_name = f"is_within_xy_{object1}_in_{object2}"
+    checker._rubric_name = f"inside_{object1}_{object2}"
     return checker
 
 

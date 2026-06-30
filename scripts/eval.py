@@ -106,7 +106,7 @@ def main(eval_args: EvalArgs):
             }
             episode_data.update(
                 {
-                    f"rubric_{key}": value
+                    f"r_{key}": value
                     for key, value in info["rubric"]["metrics"].items()
                 }
             )
