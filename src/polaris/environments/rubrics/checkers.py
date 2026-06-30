@@ -15,8 +15,13 @@ def reach(obj_name, threshold=0.05):
         obj_pos = env.scene[obj_name].data.root_pos_w[0]
         ee_pos = env.scene["ee_frame"].data.target_pos_w[0]
         dist = torch.norm(obj_pos - ee_pos)
+        checker._last_metrics = {
+            "distance": float(dist.item()),
+            "threshold": float(threshold),
+        }
         return dist < threshold
 
+    checker._rubric_name = f"reach_{obj_name}"
     return checker
 
 
@@ -27,8 +32,14 @@ def lift(obj_name, threshold=0.05, default_height=None):
         if default_height is None:
             default_height = env.scene[obj_name].data.default_root_state[0, 2]
 
-        return (object_pos[2] - default_height).item() > threshold
+        height_delta = (object_pos[2] - default_height).item()
+        checker._last_metrics = {
+            "height_delta": float(height_delta),
+            "threshold": float(threshold),
+        }
+        return height_delta > threshold
 
+    checker._rubric_name = f"lift_{obj_name}"
     return checker
 
 
@@ -51,12 +62,21 @@ def is_within_xy(
     """
 
     def checker(env):
+        metrics = {
+            "finger_joint": float("nan"),
+            "open_finger_threshold": float(open_finger_threshold),
+            "overlap_ratio": 0.0,
+            "percent_threshold": float(percent_threshold),
+            "centroid_inside": 0.0,
+        }
         # ee should be open
         stage = get_context().get_stage()
         finger_joint = env.scene["robot"].data.joint_pos[0][
             env.scene["robot"].data.joint_names.index("finger_joint")
         ]
+        metrics["finger_joint"] = float(finger_joint.item())
         if finger_joint >= open_finger_threshold:
+            checker._last_metrics = metrics
             return False
 
         obj1_prim = stage.GetPrimAtPath(f"/World/envs/env_0/scene/{object1}")
@@ -97,9 +117,11 @@ def is_within_xy(
 
             # Percentage of object1 area that is inside object2
             overlap_ratio = overlap_area / obj1_area
+            metrics["overlap_ratio"] = float(overlap_ratio)
             # print(f"{object1} is inside {object2} {overlap_ratio}")
 
             if overlap_ratio >= percent_threshold:
+                checker._last_metrics = metrics
                 return True
 
         if centroid_fallback:
@@ -108,11 +130,15 @@ def is_within_xy(
                 np.all(obj1_centroid_xy >= obj2_min_xy)
                 and np.all(obj1_centroid_xy <= obj2_max_xy)
             )
+            metrics["centroid_inside"] = float(centroid_inside)
             if centroid_inside:
+                checker._last_metrics = metrics
                 return True
 
+        checker._last_metrics = metrics
         return False
 
+    checker._rubric_name = f"is_within_xy_{object1}_in_{object2}"
     return checker
 
 

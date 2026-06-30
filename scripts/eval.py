@@ -104,6 +104,12 @@ def main(eval_args: EvalArgs):
                 "success": info["rubric"]["success"],
                 "progress": info["rubric"]["progress"],
             }
+            episode_data.update(
+                {
+                    f"rubric_{key}": value
+                    for key, value in info["rubric"]["metrics"].items()
+                }
+            )
             episode_df = pd.concat(
                 [episode_df, pd.DataFrame([episode_data])], ignore_index=True
             )

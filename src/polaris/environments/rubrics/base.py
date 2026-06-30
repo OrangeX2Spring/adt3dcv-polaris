@@ -3,6 +3,7 @@ Base class for task success/progress rubrics.
 """
 
 from dataclasses import dataclass
+import re
 from typing import Callable
 from isaaclab.envs import ManagerBasedRLEnv
 
@@ -34,6 +35,12 @@ class Rubric:
         self.criteria = criteria
         self.criteria_reached = [False] * len(criteria)
 
+    @staticmethod
+    def _metric_prefix(idx: int, fn: Callable) -> str:
+        name = getattr(fn, "_rubric_name", fn.__name__)
+        name = re.sub(r"[^0-9a-zA-Z_]+", "_", name).strip("_")
+        return f"criterion_{idx}_{name}"
+
     def evaluate(self, env: ManagerBasedRLEnv) -> RubricResult:
         """
         Evaluate current simulation state and return result.
@@ -56,13 +63,24 @@ class Rubric:
                 fn, deps = c
                 # Only evaluate if all deps ever reached
                 deps_met = all(self.criteria_reached[d] for d in deps)
-                result = fn(env) if deps_met else False
+                if deps_met:
+                    result = fn(env)
+                else:
+                    setattr(fn, "_last_metrics", {})
+                    result = False
             else:
                 fn = c
+                deps_met = True
                 result = fn(env)
             # Update max-ever reached for this criterion
             self.criteria_reached[idx] = self.criteria_reached[idx] or bool(result)
             criteria_met_now.append(bool(result))
+            prefix = self._metric_prefix(idx, fn)
+            metrics[f"{prefix}_now"] = float(bool(result))
+            metrics[f"{prefix}_ever"] = float(self.criteria_reached[idx])
+            metrics[f"{prefix}_skipped"] = float(not deps_met)
+            for key, value in getattr(fn, "_last_metrics", {}).items():
+                metrics[f"{prefix}_{key}"] = value
 
         num_reached_ever = sum(self.criteria_reached)
         progress = num_reached_ever / num_criteria if num_criteria > 0 else 0.0
