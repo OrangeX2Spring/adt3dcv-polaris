@@ -32,9 +32,22 @@ def lift(obj_name, threshold=0.05, default_height=None):
     return checker
 
 
-def is_within_xy(object1, object2, percent_threshold=0.5, open_finger_threshold=0.1):
+def is_within_xy(
+    object1,
+    object2,
+    percent_threshold=0.5,
+    open_finger_threshold=0.1,
+    centroid_fallback=False,
+):
     """
     Check if object1 is inside object2.
+
+    If centroid_fallback is True, also passes when object1's centroid lies
+    within object2's xy bbox, even if the AABB overlap ratio is below
+    percent_threshold. This helps with thin/elongated objects (e.g. tape)
+    whose AABB grows much larger than their footprint when tilted, making
+    the overlap-ratio check overly strict even though the object clearly
+    landed inside object2.
     """
 
     def checker(env):
@@ -73,20 +86,32 @@ def is_within_xy(object1, object2, percent_threshold=0.5, open_finger_threshold=
         overlap_max_y = min(obj1_max_xy[1], obj2_max_xy[1])
 
         # Check if there's any actual overlap
-        if overlap_min_x >= overlap_max_x or overlap_min_y >= overlap_max_y:
-            return False
+        has_overlap = not (overlap_min_x >= overlap_max_x or overlap_min_y >= overlap_max_y)
 
-        # Areas
-        obj1_area = (obj1_max_xy[0] - obj1_min_xy[0]) * (
-            obj1_max_xy[1] - obj1_min_xy[1]
-        )
-        overlap_area = (overlap_max_x - overlap_min_x) * (overlap_max_y - overlap_min_y)
+        if has_overlap:
+            # Areas
+            obj1_area = (obj1_max_xy[0] - obj1_min_xy[0]) * (
+                obj1_max_xy[1] - obj1_min_xy[1]
+            )
+            overlap_area = (overlap_max_x - overlap_min_x) * (overlap_max_y - overlap_min_y)
 
-        # Percentage of object1 area that is inside object2
-        overlap_ratio = overlap_area / obj1_area
-        # print(f"{object1} is inside {object2} {overlap_ratio}")
+            # Percentage of object1 area that is inside object2
+            overlap_ratio = overlap_area / obj1_area
+            # print(f"{object1} is inside {object2} {overlap_ratio}")
 
-        return overlap_ratio >= percent_threshold
+            if overlap_ratio >= percent_threshold:
+                return True
+
+        if centroid_fallback:
+            obj1_centroid_xy = np.array(obj1_centroid)[:2]
+            centroid_inside = bool(
+                np.all(obj1_centroid_xy >= obj2_min_xy)
+                and np.all(obj1_centroid_xy <= obj2_max_xy)
+            )
+            if centroid_inside:
+                return True
+
+        return False
 
     return checker
 
@@ -152,7 +177,7 @@ def get_bbox(body_prim: Usd.Prim, pos=None, quat=None, scalar_first=False):
     transformed_centroid = transform.Transform(centroid)
 
     scale = get_scale(body_prim)
-    if scale is not Gf.Vec3d(1.0, 1.0, 1.0):
+    if scale != Gf.Vec3d(1.0, 1.0, 1.0):
         # Scale corners directly
         scaled_corners = []
         for corner in transformed_corners:

@@ -129,7 +129,15 @@ gym.register(
             criteria=[
                 checkers.reach("tape_00", threshold=0.2),
                 (checkers.lift("tape_00", threshold=0.04), [0]),
-                (checkers.is_within_xy("tape_00", "container_02", percent_threshold=0.8), [1]),
+                (
+                    checkers.is_within_xy(
+                        "tape_00",
+                        "container_02",
+                        percent_threshold=0.8,
+                        centroid_fallback=True,
+                    ),
+                    [1],
+                ),
             ]
         ),
     },
