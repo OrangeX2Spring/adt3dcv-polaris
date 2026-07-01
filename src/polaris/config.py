@@ -53,6 +53,9 @@ class EvalArgs:
     initial_conditions_file: str | None = None  # Path to initial conditions file
     instruction: str | None = None  # Override language instruction
     rollouts: int | None = None  # Number of rollouts to evaluate
+    save_goal_frames: bool = False  # Save high-resolution frames for V-JEPA goals
+    goal_frame_camera: str = "external_cam"  # external_cam, wrist_cam, or both
+    goal_frame_when: str = "success"  # success, final, or both
 
 
 @dataclass

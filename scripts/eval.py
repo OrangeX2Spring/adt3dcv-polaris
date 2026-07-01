@@ -7,12 +7,33 @@ import gymnasium as gym
 import torch
 import argparse
 import pandas as pd
+import numpy as np
 
 
 from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from polaris.config import EvalArgs
+
+
+def _select_goal_frame(images: dict, camera: str):
+    if camera == "both":
+        return np.concatenate([images["external_cam"], images["wrist_cam"]], axis=1)
+    if camera not in images:
+        raise ValueError(
+            f"Goal frame camera '{camera}' not found. Available cameras: {list(images.keys())}"
+        )
+    return images[camera]
+
+
+def _save_goal_frame(env, run_folder: Path, episode: int, tag: str, camera: str):
+    goal_dir = run_folder / "goal_frames"
+    goal_dir.mkdir(parents=True, exist_ok=True)
+    images = env.custom_render(expensive=True)
+    frame = _select_goal_frame(images, camera)
+    path = goal_dir / f"episode_{episode:04d}_{tag}_{camera}.jpg"
+    mediapy.write_image(path, frame)
+    print(f"Saved {tag} goal frame to {path}")
 
 
 def main(eval_args: EvalArgs):
@@ -52,6 +73,8 @@ def main(eval_args: EvalArgs):
     # Resume CSV logging
     run_folder = Path(eval_args.run_folder)
     run_folder.mkdir(parents=True, exist_ok=True)
+    if eval_args.goal_frame_when not in {"success", "final", "both"}:
+        raise ValueError("goal_frame_when must be one of: success, final, both")
     csv_path = run_folder / "eval_results.csv"
     if csv_path.exists():
         episode_df = pd.read_csv(csv_path)
@@ -80,6 +103,7 @@ def main(eval_args: EvalArgs):
         object_positions=initial_conditions[episode % len(initial_conditions)]
     )
     policy_client.reset()
+    success_goal_frame_saved = False
     print(f" >>> Starting eval job from episode {episode + 1} of {rollouts} <<< ")
     while True:
         action, viz = policy_client.infer(obs, language_instruction)
@@ -88,10 +112,35 @@ def main(eval_args: EvalArgs):
         obs, rew, term, trunc, info = env.step(
             torch.tensor(action).reshape(1, -1), expensive=policy_client.rerender
         )
+        if (
+            eval_args.save_goal_frames
+            and eval_args.goal_frame_when in {"success", "both"}
+            and not success_goal_frame_saved
+            and info["rubric"]["success"]
+        ):
+            _save_goal_frame(
+                env,
+                run_folder,
+                episode,
+                "success",
+                eval_args.goal_frame_camera,
+            )
+            success_goal_frame_saved = True
 
         bar.update(1)
         if term[0] or trunc[0] or bar.n >= horizon:
             policy_client.reset()
+            if eval_args.save_goal_frames and eval_args.goal_frame_when in {
+                "final",
+                "both",
+            }:
+                _save_goal_frame(
+                    env,
+                    run_folder,
+                    episode,
+                    "final",
+                    eval_args.goal_frame_camera,
+                )
 
             # Save video and metadata
             filename = run_folder / f"episode_{episode}.mp4"
@@ -124,6 +173,7 @@ def main(eval_args: EvalArgs):
 
             episode += 1
             video = []
+            success_goal_frame_saved = False
             if episode >= rollouts:
                 break
 
