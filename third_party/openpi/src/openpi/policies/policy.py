@@ -40,6 +40,7 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
+        goal_image_path: str | pathlib.Path | None = None,
     ):
         self._model = model
         self._input_transform = _transforms.compose(transforms)
@@ -76,7 +77,7 @@ class Policy(BasePolicy):
             T.Normalize(mean=[0.485, 0.456, 0.406],
                         std=[0.229, 0.224, 0.225]),
         ])
-        self._goal_root = "last_frame.jpg"
+        self._goal_image_path = pathlib.Path(goal_image_path or "last_frame.jpg").expanduser()
 
             
     @override
@@ -149,7 +150,12 @@ class Policy(BasePolicy):
         
         if self._encoder is not None:
             # device = inputs.device
-            goal_frame = cv2.imread(self._goal_root)
+            goal_frame = cv2.imread(str(self._goal_image_path))
+            if goal_frame is None:
+                raise FileNotFoundError(
+                    f"Could not read V-JEPA goal image at {self._goal_image_path}. "
+                    "Pass --goal-image-path to scripts/serve_policy.py with an existing image path."
+                )
             goal_frame = self._transform(cv2.cvtColor(goal_frame, cv2.COLOR_BGR2RGB))
             goal_np = np.stack([goal_frame, goal_frame], axis=0) 
             goal_np = np.expand_dims(goal_np, axis=0)
