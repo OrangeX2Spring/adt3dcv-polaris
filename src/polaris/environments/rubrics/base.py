@@ -56,7 +56,6 @@ class Rubric:
         metrics = {}
         num_criteria = len(self.criteria)
 
-        criteria_met_now = []
         for idx, c in enumerate(self.criteria):
             # Check if c is (callable, [deps]), else treat as callable only
             if isinstance(c, tuple):
@@ -74,9 +73,7 @@ class Rubric:
                 result = fn(env)
             # Update max-ever reached for this criterion
             self.criteria_reached[idx] = self.criteria_reached[idx] or bool(result)
-            criteria_met_now.append(bool(result))
             prefix = self._metric_prefix(idx, fn)
-            metrics[f"{prefix}_now"] = float(bool(result))
             metrics[f"{prefix}_ever"] = float(self.criteria_reached[idx])
             metrics[f"{prefix}_skipped"] = float(not deps_met)
             for key, value in getattr(fn, "_last_metrics", {}).items():
@@ -93,3 +90,10 @@ class Rubric:
     def reset(self):
         """Called when environment resets. Override for stateful rubrics."""
         self.criteria_reached = [False] * len(self.criteria)
+        for c in self.criteria:
+            fn = c[0] if isinstance(c, tuple) else c
+            reset_metrics = getattr(fn, "_reset_metrics", None)
+            if reset_metrics is not None:
+                reset_metrics()
+            else:
+                setattr(fn, "_last_metrics", {})

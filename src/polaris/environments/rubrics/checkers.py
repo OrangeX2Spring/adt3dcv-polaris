@@ -15,13 +15,20 @@ def reach(obj_name, threshold=0.05):
         obj_pos = env.scene[obj_name].data.root_pos_w[0]
         ee_pos = env.scene["ee_frame"].data.target_pos_w[0]
         dist = torch.norm(obj_pos - ee_pos)
+        checker._min_distance = min(checker._min_distance, float(dist.item()))
         checker._last_metrics = {
-            "distance": float(dist.item()),
+            "min_distance": checker._min_distance,
             "threshold": float(threshold),
         }
         return dist < threshold
 
+    def reset_metrics():
+        checker._min_distance = float("inf")
+        checker._last_metrics = {}
+
     checker._rubric_name = f"reach_{obj_name}"
+    checker._reset_metrics = reset_metrics
+    reset_metrics()
     return checker
 
 
@@ -33,13 +40,23 @@ def lift(obj_name, threshold=0.05, default_height=None):
             default_height = env.scene[obj_name].data.default_root_state[0, 2]
 
         height_delta = (object_pos[2] - default_height).item()
+        checker._max_height_delta = max(
+            checker._max_height_delta,
+            float(height_delta),
+        )
         checker._last_metrics = {
-            "height_delta": float(height_delta),
+            "max_height_delta": checker._max_height_delta,
             "threshold": float(threshold),
         }
         return height_delta > threshold
 
+    def reset_metrics():
+        checker._max_height_delta = float("-inf")
+        checker._last_metrics = {}
+
     checker._rubric_name = f"lift_{obj_name}"
+    checker._reset_metrics = reset_metrics
+    reset_metrics()
     return checker
 
 
