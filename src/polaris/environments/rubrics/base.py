@@ -90,10 +90,3 @@ class Rubric:
     def reset(self):
         """Called when environment resets. Override for stateful rubrics."""
         self.criteria_reached = [False] * len(self.criteria)
-        for c in self.criteria:
-            fn = c[0] if isinstance(c, tuple) else c
-            reset_metrics = getattr(fn, "_reset_metrics", None)
-            if reset_metrics is not None:
-                reset_metrics()
-            else:
-                setattr(fn, "_last_metrics", {})
