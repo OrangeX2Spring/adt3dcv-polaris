@@ -36,7 +36,7 @@ def create_trained_policy(
             data if it doesn't already exist.
         norm_stats: The norm stats to use for the policy. If not provided, the norm stats will be loaded
             from the checkpoint directory.
-        pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
+        pytorch_device: Device to use for PyTorch models and V-JEPA scoring (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
         goal_image_path: Optional image path used as the V-JEPA goal image.
 
@@ -92,6 +92,6 @@ def create_trained_policy(
         sample_kwargs=sample_kwargs,
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
-        pytorch_device=pytorch_device if is_pytorch else None,
+        pytorch_device=pytorch_device,
         goal_image_path=goal_image_path,
     )

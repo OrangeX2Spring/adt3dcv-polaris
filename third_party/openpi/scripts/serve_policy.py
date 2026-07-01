@@ -52,6 +52,8 @@ class Args:
     record: bool = False
     # Optional V-JEPA goal image path. PNG is supported.
     goal_image_path: str | None = None
+    # Optional PyTorch/V-JEPA device, e.g. cuda, cuda:0, or cpu.
+    pytorch_device: str | None = None
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -83,6 +85,7 @@ def create_default_policy(
     *,
     default_prompt: str | None = None,
     goal_image_path: str | None = None,
+    pytorch_device: str | None = None,
 ) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
@@ -91,6 +94,7 @@ def create_default_policy(
             checkpoint.dir,
             default_prompt=default_prompt,
             goal_image_path=goal_image_path,
+            pytorch_device=pytorch_device,
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
@@ -104,12 +108,14 @@ def create_policy(args: Args) -> _policy.Policy:
                 args.policy.dir,
                 default_prompt=args.default_prompt,
                 goal_image_path=args.goal_image_path,
+                pytorch_device=args.pytorch_device,
             )
         case Default():
             return create_default_policy(
                 args.env,
                 default_prompt=args.default_prompt,
                 goal_image_path=args.goal_image_path,
+                pytorch_device=args.pytorch_device,
             )
 
 

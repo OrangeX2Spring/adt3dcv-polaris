@@ -49,8 +49,12 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._vjepa_device = torch.device(
+            pytorch_device or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        logging.info("Using V-JEPA device: %s", self._vjepa_device)
         self._num_candidates = 10
-        self._robot =  PandaFK()
+        self._robot = PandaFK(device=str(self._vjepa_device))
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
             self._model.eval()
@@ -67,6 +71,8 @@ class Policy(BasePolicy):
 
         self._encoder.load_state_dict(strip_module_prefix(ckpt["encoder"]))
         self._predictor.load_state_dict(strip_module_prefix(ckpt["predictor"]))
+        self._encoder = self._encoder.to(self._vjepa_device).eval()
+        self._predictor = self._predictor.to(self._vjepa_device).eval()
         # Initialize transform
         crop_size = 256
         self._tokens_per_frame = int((crop_size // self._encoder.patch_size) ** 2)
@@ -78,6 +84,26 @@ class Policy(BasePolicy):
                         std=[0.229, 0.224, 0.225]),
         ])
         self._goal_image_path = pathlib.Path(goal_image_path or "last_frame.jpg").expanduser()
+        self._z_goal = self._encode_goal_image()
+
+    def _encode_goal_image(self) -> torch.Tensor:
+        goal_frame = cv2.imread(str(self._goal_image_path))
+        if goal_frame is None:
+            raise FileNotFoundError(
+                f"Could not read V-JEPA goal image at {self._goal_image_path}. "
+                "Pass --goal-image-path to scripts/serve_policy.py with an existing image path."
+            )
+        goal_frame = self._transform(cv2.cvtColor(goal_frame, cv2.COLOR_BGR2RGB))
+        goal_np = np.stack([goal_frame, goal_frame], axis=0)
+        goal_np = np.expand_dims(goal_np, axis=0)
+        goal_tensor = (
+            torch.from_numpy(goal_np)
+            .float()
+            .permute(0, 2, 1, 3, 4)
+            .to(self._vjepa_device)
+        )
+        with torch.inference_mode():
+            return self._encoder(goal_tensor)[:, -self._tokens_per_frame :, :]
 
             
     @override
@@ -145,33 +171,24 @@ class Policy(BasePolicy):
         full_trajectory = np.concatenate([curr_state_expanded, future_action_np], axis=1) # Shape: (10, 3, 8)
 
         result = self._robot.convert_trajectory(full_trajectory)
-        ee_actions = torch.from_numpy(result["actions"]).float()
-        ee_states = torch.from_numpy(result["states"]).float()
+        ee_actions = torch.from_numpy(result["actions"]).float().to(self._vjepa_device)
+        ee_states = torch.from_numpy(result["states"]).float().to(self._vjepa_device)
         
         if self._encoder is not None:
-            # device = inputs.device
-            goal_frame = cv2.imread(str(self._goal_image_path))
-            if goal_frame is None:
-                raise FileNotFoundError(
-                    f"Could not read V-JEPA goal image at {self._goal_image_path}. "
-                    "Pass --goal-image-path to scripts/serve_policy.py with an existing image path."
-                )
-            goal_frame = self._transform(cv2.cvtColor(goal_frame, cv2.COLOR_BGR2RGB))
-            goal_np = np.stack([goal_frame, goal_frame], axis=0) 
-            goal_np = np.expand_dims(goal_np, axis=0)
-            goal_tensor = torch.from_numpy(goal_np).float().permute(0, 2, 1, 3, 4)
-            z_goal = self._encoder(goal_tensor)[:,-256:,:]
             frame = self._transform(np.array(observation.images["base_0_rgb"][0]))
             frames_np = np.stack([frame, frame], axis=0)  # (2, 256, 256, 3)
             frames_np = np.expand_dims(frames_np, axis=0)
-            frames_tensor = torch.from_numpy(frames_np).float().permute(0, 2, 1, 3, 4)
-            z_current = self._encoder(frames_tensor)[:,-256:,:]
-            batch_size = ee_actions.shape[0]  # 10
-            action_dim = ee_actions.shape[2]  # 7
-         
-            z_hat = rollout.forward_actions(z_current, self._predictor, ee_states, ee_actions)
-        
-            losses = rollout.loss_fn(z_hat, z_goal)  # list[10]
+            frames_tensor = (
+                torch.from_numpy(frames_np)
+                .float()
+                .permute(0, 2, 1, 3, 4)
+                .to(self._vjepa_device)
+            )
+
+            with torch.inference_mode():
+                z_current = self._encoder(frames_tensor)[:, -self._tokens_per_frame :, :]
+                z_hat = rollout.forward_actions(z_current, self._predictor, ee_states, ee_actions)
+                losses = rollout.loss_fn(z_hat, self._z_goal)  # list[10]
             best_idx = np.argmin(losses)
 
             best_action = outputs["actions"][best_idx]  # (7,) delta EE
