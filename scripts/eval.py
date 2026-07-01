@@ -8,6 +8,7 @@ import torch
 import argparse
 import pandas as pd
 import numpy as np
+import cv2
 
 
 from pathlib import Path
@@ -30,9 +31,16 @@ def _save_goal_frame(env, run_folder: Path, episode: int, tag: str, camera: str)
     goal_dir = run_folder / "goal_frames"
     goal_dir.mkdir(parents=True, exist_ok=True)
     images = env.custom_render(expensive=True)
-    frame = _select_goal_frame(images, camera)
+    frame = np.asarray(_select_goal_frame(images, camera))
+    if frame.dtype != np.uint8:
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
     path = goal_dir / f"episode_{episode:04d}_{tag}_{camera}.jpg"
-    mediapy.write_image(path, frame)
+    if frame.shape[-1] == 4:
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+    else:
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    if not cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+        raise RuntimeError(f"Failed to save goal frame to {path}")
     print(f"Saved {tag} goal frame to {path}")
 
 
