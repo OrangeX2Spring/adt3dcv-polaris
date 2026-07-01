@@ -1,5 +1,7 @@
 from collections.abc import Sequence
+import json
 import logging
+import os
 import pathlib
 import time
 from typing import Any, TypeAlias
@@ -86,6 +88,16 @@ class Policy(BasePolicy):
         ])
         self._goal_image_path = pathlib.Path(goal_image_path or "last_frame.jpg").expanduser()
         self._z_goal = self._encode_goal_image()
+
+        # Per-step energy log (JSONL). Override location with VJEPA_ENERGY_LOG.
+        self._energy_log_path = pathlib.Path(
+            os.environ.get(
+                "VJEPA_ENERGY_LOG",
+                f"vjepa_energy_{time.strftime('%Y%m%d_%H%M%S')}.jsonl",
+            )
+        ).expanduser()
+        self._infer_step = 0
+        logging.info("Logging V-JEPA energies to %s", self._energy_log_path.resolve())
 
     def _encode_goal_image(self) -> torch.Tensor:
         goal_frame = cv2.imread(str(self._goal_image_path))
@@ -199,6 +211,19 @@ class Policy(BasePolicy):
                 min(losses), max(losses), max(losses) - min(losses), best_idx,
                 [round(l, 4) for l in losses],
             )
+            with self._energy_log_path.open("a") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "wall_time": time.time(),
+                            "step": self._infer_step,
+                            "best_idx": int(best_idx),
+                            "energies": [round(l, 6) for l in losses],
+                        }
+                    )
+                    + "\n"
+                )
+            self._infer_step += 1
 
             best_action = outputs["actions"][best_idx]  # (7,) delta EE
             
