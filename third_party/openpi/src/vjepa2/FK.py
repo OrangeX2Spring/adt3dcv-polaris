@@ -12,7 +12,7 @@ panda_fk.py — Franka Panda 正运动学，全接口支持 batch 输入
 
 输出约定（V-JEPA 2-AC）：
     state  (*B, 7)  = [x, y, z, roll, pitch, yaw, gripper]
-    action (*B, 7)  = [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, gripper_t1]
+    action (*B, 7)  = [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, Δgripper]
 """
 
 from __future__ import annotations
@@ -128,9 +128,11 @@ class PandaFK:
         两帧 PolaRiS action → V-JEPA 2-AC delta action。
 
         输入：(*B, 8), (*B, 8)
-        输出：(*B, 7)  [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, gripper_t1]
+        输出：(*B, 7)  [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, Δgripper]
 
-        旋转 delta = R_t^{-1} · R_{t+1}（body 系增量）。
+        旋转 delta = R_{t+1} · R_t^{-1}（world 系增量，
+        与官方 mpc_utils.poses_to_diff 的 e_rotation @ s_rotation.T 一致）。
+        gripper 为增量 gripper_t1 - gripper_t（官方 action 约定）。
         """
         q_t  = self._to_tensor(joint_pos_t)         # (*B, 8)
         q_t1 = self._to_tensor(joint_pos_t1)
@@ -147,11 +149,14 @@ class PandaFK:
         batch_shape = T_t.shape[:-2]
         R_t  = Rotation.from_matrix(T_t.reshape(-1, 4, 4)[:, :3, :3])
         R_t1 = Rotation.from_matrix(T_t1.reshape(-1, 4, 4)[:, :3, :3])
-        delta_rpy = (R_t.inv() * R_t1).as_euler(self.euler_seq, degrees=False)
+        delta_rpy = (R_t1 * R_t.inv()).as_euler(self.euler_seq, degrees=False)
         delta_rpy = delta_rpy.reshape(*batch_shape, 3)               # (*B, 3)
 
-        gripper = np.asarray(joint_pos_t1, dtype=np.float32)[..., 7:8]  # (*B, 1)
-        return np.concatenate([delta_xyz, delta_rpy, gripper], axis=-1)  # (*B, 7)
+        gripper_delta = (
+            np.asarray(joint_pos_t1, dtype=np.float32)[..., 7:8]
+            - np.asarray(joint_pos_t, dtype=np.float32)[..., 7:8]
+        )  # (*B, 1)
+        return np.concatenate([delta_xyz, delta_rpy, gripper_delta], axis=-1)  # (*B, 7)
 
     def convert_trajectory(self, joint_pos_seq) -> dict:
         """

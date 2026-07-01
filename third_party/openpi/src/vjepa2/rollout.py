@@ -49,38 +49,31 @@ def forward_target(c, encoder, normalize_reps=True):
 #     return z_hat, s_hat
 def forward_actions(z, predictor, states, actions, normalize_reps=True):
     """
-    z       : (1, 256, 1408)   当前帧 encoder 输出，T=1
+    z       : (1, 256, 1408)   当前帧 encoder 输出（已 layer_norm），T=1
     states  : (10, 3, 7)       FK 算好，t0/t1/t2
     actions : (10, 2, 7)       delta EE，a0/a1
-    
-    predictor 每次只接受 T=1，所以逐步调用，z 滚动替换（不累积）
+
+    与官方 cem() rollout 一致：预测帧 concat 进序列，predictor 每步
+    看到完整历史 (z_traj, actions[:, :t+1], states[:, :t+1])。
     """
     S = actions.shape[0]   # 10
     T = actions.shape[1]   # 2
 
-    # z_curr 始终是单帧 (10, 256, D)，不累积
-    z_curr = z[:, :tokens_per_frame].repeat(S, 1, 1)   # (10, 256, 1408)
+    z_traj = z[:, :tokens_per_frame].repeat(S, 1, 1)   # (10, 256, 1408)
 
     for t in range(T):
-        a_t = actions[:, t:t+1, :]    # (10, 1, 7)  只取当前步
-        s_t = states[:, t:t+1, :]     # (10, 1, 7)  只取当前帧真实位姿
-        # print(f"t={t}")
-        # print(f"  z_curr shape: {z_curr.shape}")
-        # print(f"  a_t    shape: {a_t.shape}")
-        # print(f"  s_t    shape: {s_t.shape}")
-        # print(f"  grid_height={predictor.grid_height}, grid_width={predictor.grid_width}")
-        # print(f"  T inferred = {z_curr.shape[1]} // {predictor.grid_height * predictor.grid_width} = {z_curr.shape[1] // (predictor.grid_height * predictor.grid_width)}")
+        a_t = actions[:, : t + 1, :]   # (10, t+1, 7)
+        s_t = states[:, : t + 1, :]    # (10, t+1, 7)
 
-        # 三者 T 维全部 = 1，对齐
-        z_next = predictor(z_curr, a_t, s_t)   # (10, 256, 1408)
+        z_next = predictor(z_traj, a_t, s_t)[:, -tokens_per_frame:]   # (10, 256, 1408)
 
         if normalize_reps:
             z_next = F.layer_norm(z_next, (z_next.size(-1),))
 
-        z_curr = z_next   # 滚动：下一步用预测帧作为输入
+        z_traj = torch.cat([z_traj, z_next], dim=1)   # (10, 256*(t+2), 1408)
 
     # 返回最终预测帧，用于和 goal 算 loss
-    return z_curr   # (10, 256, 1408)
+    return z_traj[:, -tokens_per_frame:]   # (10, 256, 1408)
 
 def loss_fn(z, h):
     z, h = z[:, -tokens_per_frame:], h[:, -tokens_per_frame:]
