@@ -27,9 +27,10 @@ def _select_goal_frame(images: dict, camera: str):
     return images[camera]
 
 
-def _save_goal_frame(images: dict, run_folder: Path, episode: int, tag: str, camera: str):
+def _save_goal_frame(env, run_folder: Path, episode: int, tag: str, camera: str):
     goal_dir = run_folder / "goal_frames"
     goal_dir.mkdir(parents=True, exist_ok=True)
+    images = env.custom_render(expensive=True)
     frame = np.asarray(_select_goal_frame(images, camera))
     if frame.dtype != np.uint8:
         frame = np.clip(frame, 0, 255).astype(np.uint8)
@@ -126,7 +127,7 @@ def main(eval_args: EvalArgs):
             and info["rubric"]["success"]
         ):
             _save_goal_frame(
-                obs["splat"],
+                env,
                 run_folder,
                 episode,
                 "success",
@@ -142,7 +143,7 @@ def main(eval_args: EvalArgs):
                 "both",
             }:
                 _save_goal_frame(
-                    obs["splat"],
+                    env,
                     run_folder,
                     episode,
                     "final",
