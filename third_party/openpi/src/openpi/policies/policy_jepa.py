@@ -1,7 +1,5 @@
 from collections.abc import Sequence
-import json
 import logging
-import os
 import pathlib
 import time
 from typing import Any, TypeAlias
@@ -15,7 +13,6 @@ from openpi_client import base_policy as _base_policy
 from vjepa2.FK import PandaFK
 from vjepa2 import rollout
 import torch
-from torch.nn import functional as F
 from typing_extensions import override
 
 from openpi import transforms as _transforms
@@ -89,16 +86,6 @@ class Policy(BasePolicy):
         self._goal_image_path = pathlib.Path(goal_image_path or "last_frame.jpg").expanduser()
         self._z_goal = self._encode_goal_image()
 
-        # Per-step energy log (JSONL). Override location with VJEPA_ENERGY_LOG.
-        self._energy_log_path = pathlib.Path(
-            os.environ.get(
-                "VJEPA_ENERGY_LOG",
-                f"vjepa_energy_{time.strftime('%Y%m%d_%H%M%S')}.jsonl",
-            )
-        ).expanduser()
-        self._infer_step = 0
-        logging.info("Logging V-JEPA energies to %s", self._energy_log_path.resolve())
-
     def _encode_goal_image(self) -> torch.Tensor:
         goal_frame = cv2.imread(str(self._goal_image_path))
         if goal_frame is None:
@@ -116,9 +103,7 @@ class Policy(BasePolicy):
             .to(self._vjepa_device)
         )
         with torch.inference_mode():
-            h = self._encoder(goal_tensor)[:, -self._tokens_per_frame :, :]
-            # Match official WorldModel.encode: reps are layer-normed before use
-            return F.layer_norm(h, (h.size(-1),))
+            return self._encoder(goal_tensor)[:, -self._tokens_per_frame :, :]
 
             
     @override
@@ -202,28 +187,9 @@ class Policy(BasePolicy):
 
             with torch.inference_mode():
                 z_current = self._encoder(frames_tensor)[:, -self._tokens_per_frame :, :]
-                z_current = F.layer_norm(z_current, (z_current.size(-1),))
                 z_hat = rollout.forward_actions(z_current, self._predictor, ee_states, ee_actions)
                 losses = rollout.loss_fn(z_hat, self._z_goal)  # list[10]
             best_idx = np.argmin(losses)
-            logging.info(
-                "V-JEPA energies: min=%.4f max=%.4f spread=%.4f best_idx=%d all=%s",
-                min(losses), max(losses), max(losses) - min(losses), best_idx,
-                [round(l, 4) for l in losses],
-            )
-            with self._energy_log_path.open("a") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "wall_time": time.time(),
-                            "step": self._infer_step,
-                            "best_idx": int(best_idx),
-                            "energies": [round(l, 6) for l in losses],
-                        }
-                    )
-                    + "\n"
-                )
-            self._infer_step += 1
 
             best_action = outputs["actions"][best_idx]  # (7,) delta EE
             
