@@ -52,11 +52,19 @@ def create_trained_policy(
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
 
-    logging.info("Loading model...")
-    if is_pytorch:
+    # Some policy variants (e.g. the V-JEPA CEM controller) never touch `model` and only need
+    # it loaded for its GPU memory footprint's sake — skip the load entirely for those, since
+    # pi0.5 weights (several GB) competing with V-JEPA-giant on the same GPU can OOM.
+    needs_model = getattr(_policy.Policy, "NEEDS_MODEL", True)
+    if not needs_model:
+        logging.info("Active policy declares NEEDS_MODEL=False; skipping pi0.5 weight load.")
+        model = None
+    elif is_pytorch:
+        logging.info("Loading model...")
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
+        logging.info("Loading model...")
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
