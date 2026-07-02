@@ -19,7 +19,9 @@ from collections.abc import Sequence
 import logging
 import os
 import pathlib
+import sys
 import time
+from pathlib import Path
 from typing import Any, TypeAlias
 
 import cv2
@@ -29,6 +31,11 @@ from torch.nn import functional as F
 import torchvision.transforms as T
 from openpi_client import base_policy as _base_policy
 from typing_extensions import override
+
+# Put third_party/ on the path so the OFFICIAL vjepa2 (notebooks/, src/) resolves, merging with
+# the glue vjepa2 package (FK, rollout) under openpi/src as one namespace package. Same trick as
+# vjepa2/rollout.py; must run before importing from vjepa2.notebooks.
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 from vjepa2.FK import PandaFK
 from vjepa2.notebooks.utils.mpc_utils import cem, compute_new_pose
