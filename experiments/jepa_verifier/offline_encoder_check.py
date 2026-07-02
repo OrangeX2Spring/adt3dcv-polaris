@@ -77,6 +77,9 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", default="offline_encoder_check")
     ap.add_argument("--stride", type=int, default=3, help="encode every k-th frame")
+    ap.add_argument("--mask-dir", default=None,
+                    help="dir with mask_XXXX.npy (grid x grid bool); if set, L1 is averaged "
+                         "only over foreground tokens (bowl/food region) for that episode")
     args = ap.parse_args()
     if (args.goal is None) == (args.goal_dir is None):
         ap.error("pass exactly one of --goal or --goal-dir")
@@ -119,59 +122,101 @@ def main():
         zs = [encode_frame(encoder, transform, f, tokens_per_frame, device) for f in frames]
         name = Path(vp).stem
 
+        idx = ep_index(vp)
         if z_goal_shared is not None:
             z_goal = z_goal_shared
         else:
-            idx = ep_index(vp)
             gpath = Path(args.goal_dir) / f"goal_{idx:04d}.png"
             if not gpath.exists():
                 print(f"  !! skip {name}: no goal {gpath}")
                 continue
             z_goal = load_goal_z(gpath)
 
-        # (1) energy to the EXTERNAL goal image (goal-render path)
-        e_goal = np.array([F.l1_loss(z, z_goal).item() for z in zs])
-        # (2) energy to THIS video's OWN last frame (same obs-render path as all frames).
-        #     Isolates the goal-vs-obs render-path gap: if the encoder separates task states,
-        #     this must fall smoothly toward ~0 near the end; last point is 0 by construction.
-        z_self = zs[-1]
-        e_self = np.array([F.l1_loss(z, z_self).item() for z in zs])
+        # foreground-token mask (bowl/food region). Required for the order-invariant metrics.
+        tok_mask = None
+        pmask = None
+        if args.mask_dir is not None:
+            mpath = Path(args.mask_dir) / f"mask_{idx:04d}.npy"
+            if not mpath.exists() or not np.load(mpath).any():
+                print(f"  !! skip {name}: missing/empty mask {mpath}")
+                continue
+            m2d = np.load(mpath).astype(bool)                    # (grid,grid)
+            tok_mask = torch.from_numpy(m2d.reshape(-1)).to(device)
+            H, W = frames[0].shape[:2]
+            pmask = cv2.resize(m2d.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+        # goal pixels (for the color-distribution metric)
+        goal_img = None
+        if pmask is not None:
+            gp = Path(args.goal_dir) / f"goal_{idx:04d}.png" if args.goal_dir else Path(args.goal)
+            gbgr = cv2.imread(str(gp))
+            goal_img = cv2.cvtColor(cv2.resize(gbgr, (frames[0].shape[1], frames[0].shape[0])),
+                                    cv2.COLOR_BGR2RGB)
+
+        def color_hist(img, pm, bins=16):
+            px = img[pm]                                         # (N,3)
+            h = np.concatenate([np.histogram(px[:, c], bins=bins, range=(0, 255))[0]
+                                for c in range(3)]).astype(float)
+            return h / (h.sum() + 1e-8)
+
+        # Three metrics vs the goal, all restricted to the bowl/food tokens/pixels:
+        #  posl1 = position-matched token L1 (current default; pose-sensitive via RoPE)
+        #  pool  = L1 of MEAN-POOLED masked feature (order-invariant over tokens)
+        #  hist  = L1 between masked-region color histograms (pixel distribution, pose-free)
+        def posl1(z):
+            return (z - z_goal).abs()[:, tok_mask, :].mean().item() if tok_mask is not None \
+                else F.l1_loss(z, z_goal).item()
+
+        gpool = z_goal[:, tok_mask, :].mean(dim=1) if tok_mask is not None else z_goal.mean(dim=1)
+        def pool(z):
+            zp = z[:, tok_mask, :].mean(dim=1) if tok_mask is not None else z.mean(dim=1)
+            return (zp - gpool).abs().mean().item()
+
+        ghist = color_hist(goal_img, pmask) if pmask is not None else None
+        def hist(frame):
+            return float(np.abs(color_hist(frame, pmask) - ghist).sum()) if pmask is not None else 0.0
+
+        e_pos = np.array([posl1(z) for z in zs])
+        e_pool = np.array([pool(z) for z in zs])
+        e_hist = np.array([hist(f) for f in frames]) if pmask is not None else np.zeros(len(zs))
 
         xs = np.linspace(0, 1, len(zs))
-        ax.plot(xs, e_goal, marker=".", ms=3, lw=1, label=name)
-        ax2.plot(xs, e_self, marker=".", ms=3, lw=1, label=name)
+        ax.plot(xs, e_pool, marker=".", ms=3, lw=1, label=name)
+        ax2.plot(xs, e_hist, marker=".", ms=3, lw=1, label=name)
 
-        m = len(e_goal)
-        trend = e_goal[-max(1, m // 3):].mean() - e_goal[: max(1, m // 3)].mean()
-        # self-goal: how much does the first frame differ from the last (same render path)?
-        self_range = e_self[0] - e_self[-1]  # = e_self[0], since e_self[-1]=0
-        rows.append((name, len(zs), e_goal[0], e_goal[-1], e_goal.min(), trend, e_self[0]))
-        print(f"{name}: n={len(zs)} E0={e_goal[0]:.4f} Elast={e_goal[-1]:.4f} "
-              f"Emin={e_goal.min():.4f} trend={trend:+.4f} | self-goal first-frame dist={e_self[0]:.4f}")
+        def tr(e):
+            k = max(1, len(e) // 3)
+            return e[-k:].mean() - e[:k].mean()
+        rows.append((name, len(zs),
+                     e_pos[0], e_pos[-1], tr(e_pos),
+                     e_pool[0], e_pool[-1], tr(e_pool),
+                     e_hist[0], e_hist[-1], tr(e_hist)))
+        print(f"{name}: n={len(zs)} | posL1 tr={tr(e_pos):+.4f} | pool tr={tr(e_pool):+.4f} "
+              f"| hist tr={tr(e_hist):+.4f}")
 
-    ax.set_xlabel("normalized episode time")
-    ax.set_ylabel("encoder L1 to EXTERNAL goal image")
-    ax.set_title("(1) vs external goal (goal-render path)")
-    ax.legend(fontsize=7, ncol=2); ax.grid(alpha=0.3)
-    ax2.set_xlabel("normalized episode time")
-    ax2.set_ylabel("encoder L1 to this video's OWN last frame")
-    ax2.set_title("(2) vs own last frame (same obs-render path)")
-    ax2.legend(fontsize=7, ncol=2); ax2.grid(alpha=0.3)
-    fig.suptitle("Go/no-go: does latent-L1-to-goal track progress? "
-                 "(1) flat but (2) descending ⇒ render-path gap; both flat ⇒ encoder no signal")
+    ax.set_xlabel("normalized episode time"); ax.set_ylabel("mean-pooled masked feature L1 to goal")
+    ax.set_title("(A) order-invariant V-JEPA feature (pooled over bowl tokens)")
+    ax.legend(fontsize=6, ncol=3); ax.grid(alpha=0.3)
+    ax2.set_xlabel("normalized episode time"); ax2.set_ylabel("bowl-region color-histogram L1 to goal")
+    ax2.set_title("(B) pixel color distribution (pose-free)")
+    ax2.legend(fontsize=6, ncol=3); ax2.grid(alpha=0.3)
+    fig.suptitle("Pose-invariant progress signals over the bowl region "
+                 "(descending toward goal = usable verifier signal)")
     fig.tight_layout()
     fig.savefig(f"{args.out}.png", dpi=160)
 
     with open(f"{args.out}.csv", "w") as fcsv:
-        fcsv.write("episode,n_frames,E_first,E_last,E_min,trend_last_minus_first,self_goal_first_frame_dist\n")
+        fcsv.write("episode,n_frames,"
+                   "posl1_first,posl1_last,posl1_trend,"
+                   "pool_first,pool_last,pool_trend,"
+                   "hist_first,hist_last,hist_trend\n")
         for r in rows:
-            fcsv.write(f"{r[0]},{r[1]},{r[2]:.6f},{r[3]:.6f},{r[4]:.6f},{r[5]:.6f},{r[6]:.6f}\n")
-    n_down = sum(1 for r in rows if r[5] < 0)
-    print(f"\nsaved {args.out}.png / .csv")
-    print(f"episodes with downward external-goal trend: {n_down}/{len(rows)}")
-    print("Interpretation: if self-goal first-frame dist >> external-goal spread, the encoder DOES "
-          "separate states and the flat external-goal curve is a goal/obs render-path gap "
-          "(fixable). If self-goal dist is also tiny, the encoder carries no task signal here.")
+            fcsv.write(f"{r[0]},{r[1]}," + ",".join(f"{v:.6f}" for v in r[2:]) + "\n")
+    print(f"\nsaved {args.out}.png / .csv  ({len(rows)} episodes)")
+    for label, base in [("posL1", 2), ("pool", 5), ("hist", 8)]:
+        trends = [r[base + 2] for r in rows]
+        down = sum(1 for t in trends if t < 0)
+        print(f"  {label:>6}: {down}/{len(trends)} episodes trend down toward goal")
 
 
 if __name__ == "__main__":
