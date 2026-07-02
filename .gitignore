@@ -269,8 +269,11 @@ third_party/openpi/examples/libero/
 third_party/openpi/.git-upstream-backup
 third_party/vjepa2/.git-upstream-backup
 
-# Local experiment logs and figures (kept out of the shared repo)
-experiments/jepa_verifier/
+# Local experiment logs/figures/reports (kept out of the shared repo); scripts (.py) are tracked
+experiments/jepa_verifier/*.md
+experiments/jepa_verifier/*.csv
+experiments/jepa_verifier/*.jsonl
+experiments/jepa_verifier/figs/
 third_party/openpi/vjepa_energy_*.jsonl
 
 # macOS system files
