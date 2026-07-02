@@ -173,6 +173,46 @@ class PandaFK:
         actions = self.delta_action(x[..., :-1, :], x[..., 1:, :])  # (*B, T-1, 7)
         return {"states": states, "actions": actions}
 
+    # ── 逆运动学（雅可比 DLS，用于 V-JEPA CEM 的 EE→关节 转换）──────────────────────
+    # Panda 关节限位 (rad)，用于 clamp IK 解
+    _JOINT_LIMITS = np.array([
+        [-2.8973, 2.8973], [-1.7628, 1.7628], [-2.8973, 2.8973], [-3.0718, -0.0698],
+        [-2.8973, 2.8973], [-0.0175, 3.7525], [-2.8973, 2.8973],
+    ], dtype=np.float32)
+
+    def ik(self, target_pose6, q_init7, iters: int = 60, damping: float = 0.05,
+           step: float = 0.5, pos_tol: float = 2e-3, rot_tol: float = 5e-3) -> np.ndarray:
+        """
+        目标 6D EE 位姿 → 7 关节角（阻尼最小二乘雅可比 IK，从 q_init7 热启动）。
+
+        输入：target_pose6 (6,) [x,y,z,roll,pitch,yaw]；q_init7 (7,) 当前关节角
+        输出：(7,) 关节角（已 clamp 到限位）；小 delta 下几步即收敛。
+        专为 CEM 的小步长（|Δxyz|≤~0.05m/步）设计——热启动使其稳定不跳变。
+        """
+        target_pose6 = np.asarray(target_pose6, dtype=np.float32)
+        p_tgt = target_pose6[:3]
+        R_tgt = Rotation.from_euler(self.euler_seq, target_pose6[3:6], degrees=False).as_matrix()
+
+        q = torch.tensor(np.asarray(q_init7, dtype=np.float32)[:7], device=self.device)
+        lim = torch.tensor(self._JOINT_LIMITS, device=self.device)
+
+        for _ in range(iters):
+            T_cur = self._chain.forward_kinematics(q[None]).get_matrix()[0].cpu().numpy()  # (4,4)
+            p_cur = T_cur[:3, 3]
+            R_cur = T_cur[:3, :3]
+            e_pos = p_tgt - p_cur                                      # (3,)
+            e_rot = Rotation.from_matrix(R_tgt @ R_cur.T).as_rotvec()  # (3,) world-frame
+            if np.linalg.norm(e_pos) < pos_tol and np.linalg.norm(e_rot) < rot_tol:
+                break
+            err = torch.tensor(np.concatenate([e_pos, e_rot]), dtype=torch.float32, device=self.device)  # (6,)
+            J = self._chain.jacobian(q[None])[0]                       # (6,7) [v;w] in base frame
+            JT = J.transpose(0, 1)
+            reg = (damping ** 2) * torch.eye(6, device=self.device)
+            dq = JT @ torch.linalg.solve(J @ JT + reg, err)            # (7,)
+            q = torch.clamp(q + step * dq, lim[:, 0], lim[:, 1])
+
+        return q.detach().cpu().numpy()
+
 
 # # ── 验证 ───────────────────────────────────────────────────────────────────────
 # if __name__ == "__main__":
