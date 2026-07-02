@@ -70,11 +70,16 @@ def read_video_frames(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--videos-glob", required=True)
-    ap.add_argument("--goal", required=True)
+    ap.add_argument("--goal", default=None, help="single shared goal image (all videos)")
+    ap.add_argument("--goal-dir", default=None,
+                    help="per-episode goals: dir with goal_XXXX.png matched by the episode index "
+                         "parsed from each video filename (episode_N.mp4 -> goal_000N.png)")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", default="offline_encoder_check")
     ap.add_argument("--stride", type=int, default=3, help="encode every k-th frame")
     args = ap.parse_args()
+    if (args.goal is None) == (args.goal_dir is None):
+        ap.error("pass exactly one of --goal or --goal-dir")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     encoder, _ = torch.hub.load("facebookresearch/vjepa2", "vjepa2_ac_vit_giant", pretrained=False)
@@ -84,16 +89,25 @@ def main():
     tokens_per_frame = int((256 // encoder.patch_size) ** 2)
     transform = build_transform()
 
-    goal_bgr = cv2.imread(args.goal)
-    if goal_bgr is None:
-        raise FileNotFoundError(f"goal image not found: {args.goal}")
-    z_goal = encode_frame(encoder, transform, cv2.cvtColor(goal_bgr, cv2.COLOR_BGR2RGB),
-                          tokens_per_frame, device)
+    def load_goal_z(path):
+        bgr = cv2.imread(str(path))
+        if bgr is None:
+            raise FileNotFoundError(f"goal image not found: {path}")
+        return encode_frame(encoder, transform, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
+                            tokens_per_frame, device)
+
+    def ep_index(video_path):
+        # 'episode_7.mp4' -> 7
+        stem = Path(video_path).stem
+        digits = "".join(c for c in stem if c.isdigit())
+        return int(digits) if digits else None
+
+    z_goal_shared = load_goal_z(args.goal) if args.goal else None
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     videos = sorted(glob.glob(args.videos_glob))
-    print(f"{len(videos)} videos; goal={args.goal}")
+    print(f"{len(videos)} videos; goal={'per-episode ' + args.goal_dir if args.goal_dir else args.goal}")
 
     import matplotlib
     matplotlib.use("Agg")
@@ -104,6 +118,16 @@ def main():
         frames = read_video_frames(vp)[:: args.stride]
         zs = [encode_frame(encoder, transform, f, tokens_per_frame, device) for f in frames]
         name = Path(vp).stem
+
+        if z_goal_shared is not None:
+            z_goal = z_goal_shared
+        else:
+            idx = ep_index(vp)
+            gpath = Path(args.goal_dir) / f"goal_{idx:04d}.png"
+            if not gpath.exists():
+                print(f"  !! skip {name}: no goal {gpath}")
+                continue
+            z_goal = load_goal_z(gpath)
 
         # (1) energy to the EXTERNAL goal image (goal-render path)
         e_goal = np.array([F.l1_loss(z, z_goal).item() for z in zs])
