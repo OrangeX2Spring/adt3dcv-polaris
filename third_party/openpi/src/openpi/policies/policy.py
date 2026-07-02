@@ -171,26 +171,38 @@ class Policy(BasePolicy):
         }
 
         actions_joint = outputs["actions"][:,:,:8]  # (num_candidates, action_horizon, action_dim)
-        actions_joint_downsampled = actions_joint[:, [7, 15], :]  # Downsample to match V-JEPA input requirements
+        # A2: sample 4 frames ~0.27s apart (16-step chunk at 15Hz) so each V-JEPA action
+        # spans ~one DROID 4fps step (~0.25s), matching the predictor's training granularity.
+        # Previously [7, 15] gave 2 steps of ~0.53s each (~2x training magnitude, OOD).
+        actions_joint_downsampled = actions_joint[:, [3, 7, 11, 15], :]  # (10, 4, 8)
 
         state_joint = outputs["state"][:,:8]
         curr_state_np = np.array(state_joint)      # (10, 8)
-        future_action_np = np.array(actions_joint_downsampled)  # (10, 2, 8)
+        future_action_np = np.array(actions_joint_downsampled)  # (10, 4, 8)
 
         # 2. 给当前帧状态插入时序维度 (Time Dimension)
         # 从 (10, 8) 变成 (10, 1, 8)，代表 t0 帧
         curr_state_expanded = curr_state_np[:, np.newaxis, :]
 
-        # 3. 沿时序轴（axis=1）无缝拼接，组合成长为 T=3 的完整轨迹序列
-        # [t0] + [t1, t2] = [t0, t1, t2]
-        full_trajectory = np.concatenate([curr_state_expanded, future_action_np], axis=1) # Shape: (10, 3, 8)
+        # 3. 沿时序轴（axis=1）无缝拼接，组合成长为 T=5 的完整轨迹序列
+        # [t0] + [t1..t4] = [t0, t1, t2, t3, t4]
+        full_trajectory = np.concatenate([curr_state_expanded, future_action_np], axis=1) # Shape: (10, 5, 8)
 
         result = self._robot.convert_trajectory(full_trajectory)
         ee_actions = torch.from_numpy(result["actions"]).float().to(self._vjepa_device)
         ee_states = torch.from_numpy(result["states"]).float().to(self._vjepa_device)
         
         if self._encoder is not None:
-            frame = self._transform(np.array(observation.images["base_0_rgb"][0]))
+            # A1: encode the RAW uint8 camera frame (RGB, H,W,C), matching the goal-image
+            # path exactly. openpi's pipeline has already mapped observation.images to
+            # [-1,1] float; feeding that to self._transform's ToPILImage (which assumes
+            # [0,1]) wraps negative pixels and corrupts the current-frame embedding.
+            raw_base = np.asarray(obs["observation/exterior_image_1_left"])
+            if np.issubdtype(raw_base.dtype, np.floating):
+                raw_base = (255 * raw_base).astype(np.uint8)
+            if raw_base.shape[0] == 3:  # C,H,W -> H,W,C
+                raw_base = np.transpose(raw_base, (1, 2, 0))
+            frame = self._transform(raw_base)
             frames_np = np.stack([frame, frame], axis=0)  # (2, 256, 256, 3)
             frames_np = np.expand_dims(frames_np, axis=0)
             frames_tensor = (
