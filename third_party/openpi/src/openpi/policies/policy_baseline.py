@@ -33,7 +33,6 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
-        goal_image_path=None,  # accepted for policy_config compatibility; unused in baseline
     ):
         """Initialize the Policy.
 

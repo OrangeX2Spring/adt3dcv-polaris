@@ -1,3 +1,4 @@
+import inspect
 import logging
 import os
 import pathlib
@@ -74,6 +75,13 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    # Policy variants are swapped in by renaming files (policy_baseline.py, policy_jepa*.py
+    # -> policy.py); only pass optional kwargs that the active variant actually accepts.
+    optional_kwargs = {}
+    accepted = inspect.signature(_policy.Policy.__init__).parameters
+    if "goal_image_path" in accepted:
+        optional_kwargs["goal_image_path"] = goal_image_path
+
     return _policy.Policy(
         model,
         transforms=[
@@ -93,5 +101,5 @@ def create_trained_policy(
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device,
-        goal_image_path=goal_image_path,
+        **optional_kwargs,
     )
