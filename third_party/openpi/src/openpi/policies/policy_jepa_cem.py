@@ -82,6 +82,7 @@ class Policy(BasePolicy):
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+        self._normalize_reps = True
         self._goal_image_path = pathlib.Path(goal_image_path or "last_frame.jpg").expanduser()
         self._z_goal = self._encode_goal_image()
 
@@ -97,7 +98,6 @@ class Policy(BasePolicy):
             verbose=False,
         )
         logging.info("CEM args: %s", self._mpc_args)
-        self._normalize_reps = True
 
     def _encode_np(self, frame_rgb_uint8: np.ndarray) -> torch.Tensor:
         t = self._transform(frame_rgb_uint8)                 # (3,256,256)
