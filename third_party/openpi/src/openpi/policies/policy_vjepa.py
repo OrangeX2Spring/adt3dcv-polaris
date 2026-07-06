@@ -154,7 +154,7 @@ class Policy(BasePolicy):
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
-
+        print("actions.shape", outputs["actions"].shape)
         actions_joint = outputs["actions"][:,:,:8]  # (num_candidates, action_horizon, action_dim)
         actions_joint_downsampled = actions_joint[:, [7, 15], :]  # Downsample to match V-JEPA input requirements
 
@@ -199,6 +199,7 @@ class Policy(BasePolicy):
                 "actions": best_action[None, ...],
             }
         model_time = time.monotonic() - start_time
+        print("Total FPS:", 1/ model_time)
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:

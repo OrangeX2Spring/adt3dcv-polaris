@@ -9,7 +9,7 @@ import argparse
 import pandas as pd
 import numpy as np
 
-
+import time
 from pathlib import Path
 from isaaclab.app import AppLauncher
 
@@ -105,13 +105,17 @@ def main(eval_args: EvalArgs):
     policy_client.reset()
     success_goal_frame_saved = False
     print(f" >>> Starting eval job from episode {episode + 1} of {rollouts} <<< ")
+
     while True:
         action, viz = policy_client.infer(obs, language_instruction)
         if viz is not None:
             video.append(viz)
+        #t0 = time.monotonic()
         obs, rew, term, trunc, info = env.step(
             torch.tensor(action).reshape(1, -1), expensive=policy_client.rerender
         )
+        #model_time = time.monotonic() - t0
+        #print("dt:", model_time)
         if (
             eval_args.save_goal_frames
             and eval_args.goal_frame_when in {"success", "both"}
