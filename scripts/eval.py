@@ -6,6 +6,8 @@ import tqdm
 import gymnasium as gym
 import torch
 import argparse
+import os
+import json
 import pandas as pd
 import numpy as np
 
@@ -70,6 +72,20 @@ def main(eval_args: EvalArgs):
         rollouts=eval_args.rollouts,
     )
     rollouts = len(initial_conditions)
+
+    # Optional instrumentation (env-var gated; no effect unless set):
+    #   POLARIS_FIX_IC=<idx> -> run this SAME initial condition every rollout
+    #                           (repeat one IC in a single session to measure run-to-run variance)
+    #   POLARIS_STEP_LOG=1   -> dump per-step progress + checker _ever flags to
+    #                           episode_<k>_steps.jsonl (locates each subtask's completion frame)
+    _fix_ic = os.environ.get("POLARIS_FIX_IC")
+    _step_log = os.environ.get("POLARIS_STEP_LOG")
+    step_records: list[dict] = []
+
+    def _ic_for(ep: int):
+        idx = int(_fix_ic) if _fix_ic is not None else ep % len(initial_conditions)
+        return initial_conditions[idx]
+
     # Resume CSV logging
     run_folder = Path(eval_args.run_folder)
     run_folder.mkdir(parents=True, exist_ok=True)
@@ -100,7 +116,7 @@ def main(eval_args: EvalArgs):
     horizon = env.max_episode_length
     bar = tqdm.tqdm(range(horizon))
     obs, info = env.reset(
-        object_positions=initial_conditions[episode % len(initial_conditions)]
+        object_positions=_ic_for(episode)
     )
     policy_client.reset()
     success_goal_frame_saved = False
@@ -112,6 +128,19 @@ def main(eval_args: EvalArgs):
         obs, rew, term, trunc, info = env.step(
             torch.tensor(action).reshape(1, -1), expensive=policy_client.rerender
         )
+        if _step_log:
+            step_records.append(
+                {
+                    "step": bar.n,
+                    "frame": max(0, len(video) - 1),
+                    "progress": float(info["rubric"]["progress"]),
+                    **{
+                        k: bool(v)
+                        for k, v in info["rubric"]["metrics"].items()
+                        if k.endswith("_ever")
+                    },
+                }
+            )
         if (
             eval_args.save_goal_frames
             and eval_args.goal_frame_when in {"success", "both"}
@@ -146,6 +175,12 @@ def main(eval_args: EvalArgs):
             filename = run_folder / f"episode_{episode}.mp4"
             mediapy.write_video(filename, video, fps=15)
 
+            if _step_log and step_records:
+                (run_folder / f"episode_{episode}_steps.jsonl").write_text(
+                    "\n".join(json.dumps(r) for r in step_records)
+                )
+                step_records = []
+
             # Log episode results to CSV
             episode_data = {
                 "episode": episode,
@@ -168,7 +203,7 @@ def main(eval_args: EvalArgs):
             print(f"Episode {episode} finished. Episode length: {bar.n}")
             bar = tqdm.tqdm(range(horizon))
             obs, info = env.reset(
-                object_positions=initial_conditions[episode % len(initial_conditions)]
+                object_positions=_ic_for(episode)
             )
 
             episode += 1
