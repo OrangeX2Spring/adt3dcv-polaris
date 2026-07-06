@@ -71,6 +71,10 @@ def main():
                     help="V2 pitfall: an EXTERNAL goal image file. A separately-rendered image "
                          "(e.g. *_external_cam.png) sits in a different render domain and pins every "
                          "distance ~0.67 (flat) -> use --goal-from-episode instead. Overrides it if set.")
+    ap.add_argument("--goal-dir", default=None,
+                    help="V4: per-episode SYNTHETIC goals. Dir with goal_XXXX.png; each episode is "
+                         "compared to ITS OWN goal (goal_<ep:04d>.png). Overrides --goal / "
+                         "--goal-from-episode and disables the ep3 reference line.")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--success", default="2,11,21", help="comma list of SUCCESS episode indices (exclude 3)")
     ap.add_argument("--fail", default="6,26,47", help="comma list of FAIL episode indices")
@@ -93,27 +97,42 @@ def main():
     tokens_per_frame = int((256 // encoder.patch_size) ** 2)
     transform = build_transform()
 
-    if args.goal is not None:
-        # V2 path: external goal image file (different render domain -> flat ~0.67).
-        gbgr = cv2.imread(str(args.goal))
+    def encode_goal_file(path):
+        gbgr = cv2.imread(str(path))
         if gbgr is None:
-            raise FileNotFoundError(f"goal image not found: {args.goal}")
-        goal_rgb = cv2.cvtColor(gbgr, cv2.COLOR_BGR2RGB)
+            raise FileNotFoundError(f"goal image not found: {path}")
+        return encode_frame(encoder, transform, cv2.cvtColor(gbgr, cv2.COLOR_BGR2RGB),
+                            tokens_per_frame, device)
+
+    per_episode_goal = args.goal_dir is not None
+    z_goal_shared = None
+    if per_episode_goal:
+        # V4 path: each episode vs its OWN synthetic goal_<ep:04d>.png.
+        args.include_source = False
+        print(f"GOAL = per-episode synthetic goals in {args.goal_dir}  (V4-style; each curve vs its "
+              f"own goal; expect NO episode to descend, success~fail末帧)")
+    elif args.goal is not None:
+        # V2 path: external goal image file (different render domain -> flat ~0.67).
+        z_goal_shared = encode_goal_file(args.goal)
         print(f"GOAL = external file {args.goal}  (V2-style; expect all curves flat ~0.67)")
     else:
         # V3 path: last base-cam frame of the source episode's own video (same render pipeline).
         src = Path(args.videos_dir) / f"episode_{args.goal_from_episode}.mp4"
         if not src.exists():
             raise FileNotFoundError(f"goal-source video not found: {src}")
-        goal_rgb = read_base_frames(src)[-1]
+        z_goal_shared = encode_frame(encoder, transform, read_base_frames(src)[-1],
+                                     tokens_per_frame, device)
         print(f"GOAL = last base-cam frame of {src.name}  (V3-style; expect ep"
               f"{args.goal_from_episode} to descend, others flat)")
-    z_goal = encode_frame(encoder, transform, goal_rgb, tokens_per_frame, device)
 
     def curve(ep):
         vp = Path(args.videos_dir) / f"episode_{ep}.mp4"
         if not vp.exists():
             raise FileNotFoundError(f"missing video: {vp}")
+        if per_episode_goal:
+            z_goal = encode_goal_file(Path(args.goal_dir) / f"goal_{ep:04d}.png")
+        else:
+            z_goal = z_goal_shared
         frames = read_base_frames(vp)[:: args.stride]
         e = np.array([F.l1_loss(encode_frame(encoder, transform, f, tokens_per_frame, device),
                                 z_goal).item() for f in frames])
@@ -139,9 +158,14 @@ def main():
         ax.plot(xs, e, "-", lw=3.2, color="black", marker="D", ms=5, label="ep 3  (goal source)")
 
     ax.set_xlabel("normalized episode time  (0 = start,  1 = end)")
-    ax.set_ylabel("latent L1 distance to episode-3 goal")
-    ax.set_title("Episode-3's goal image does not transfer:\n"
-                 "even successful episodes never descend toward it")
+    if per_episode_goal:
+        ax.set_ylabel("latent L1 distance to that episode's own synthetic goal")
+        ax.set_title("Per-episode synthetic goals don't work either:\n"
+                     "even successful episodes don't descend toward their own goal")
+    else:
+        ax.set_ylabel("latent L1 distance to episode-3 goal")
+        ax.set_title("Episode-3's goal image does not transfer:\n"
+                     "even successful episodes never descend toward it")
     ax.grid(alpha=0.3)
     ax.legend(frameon=False, ncol=2)
     fig.tight_layout()
