@@ -73,17 +73,19 @@ def main(eval_args: EvalArgs):
     )
     rollouts = len(initial_conditions)
 
-    # Optional instrumentation (env-var gated; no effect unless set):
-    #   POLARIS_FIX_IC=<idx> -> run this SAME initial condition every rollout
-    #                           (repeat one IC in a single session to measure run-to-run variance)
-    #   POLARIS_STEP_LOG=1   -> dump per-step progress + checker _ever flags to
-    #                           episode_<k>_steps.jsonl (locates each subtask's completion frame)
-    _fix_ic = os.environ.get("POLARIS_FIX_IC")
-    _step_log = os.environ.get("POLARIS_STEP_LOG")
+    # Optional instrumentation (CLI-flag gated; strict no-op unless the flags are passed):
+    #   --fix-ic <idx>  -> use this SAME initial-condition index for every rollout
+    #                      (repeat one IC in a single session to measure run-to-run variance)
+    #   --step-log      -> dump per-step progress + checker _ever flags to
+    #                      episode_<k>_steps.jsonl (locates each subtask's completion frame)
+    _fix_ic = eval_args.fix_ic
+    _step_log = eval_args.step_log
     step_records: list[dict] = []
 
-    def _ic_for(ep: int):
-        idx = int(_fix_ic) if _fix_ic is not None else ep % len(initial_conditions)
+    def _reset_positions(ep: int):
+        idx = _fix_ic if _fix_ic is not None else ep % len(initial_conditions)
+        tag = "  (pinned via --fix-ic)" if _fix_ic is not None else ""
+        print(f"[eval] rollout uses initial-condition index {idx}{tag}")
         return initial_conditions[idx]
 
     # Resume CSV logging
@@ -116,7 +118,7 @@ def main(eval_args: EvalArgs):
     horizon = env.max_episode_length
     bar = tqdm.tqdm(range(horizon))
     obs, info = env.reset(
-        object_positions=_ic_for(episode)
+        object_positions=_reset_positions(episode)
     )
     policy_client.reset()
     success_goal_frame_saved = False
@@ -203,7 +205,7 @@ def main(eval_args: EvalArgs):
             print(f"Episode {episode} finished. Episode length: {bar.n}")
             bar = tqdm.tqdm(range(horizon))
             obs, info = env.reset(
-                object_positions=_ic_for(episode)
+                object_positions=_reset_positions(episode)
             )
 
             episode += 1

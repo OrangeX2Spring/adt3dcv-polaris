@@ -56,6 +56,8 @@ class EvalArgs:
     save_goal_frames: bool = False  # Save high-resolution frames for V-JEPA goals
     goal_frame_camera: str = "external_cam"  # external_cam, wrist_cam, or both
     goal_frame_when: str = "success"  # success, final, or both
+    fix_ic: int | None = None  # if set, use this SAME initial-condition index for every rollout
+    step_log: bool = False  # dump per-step progress + checker _ever flags to episode_<k>_steps.jsonl
 
 
 @dataclass
