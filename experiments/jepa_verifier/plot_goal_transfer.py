@@ -128,6 +128,7 @@ def main():
     ax.grid(alpha=0.3)
     ax.legend(frameon=False, ncol=2)
     fig.tight_layout()
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(f"{args.out}.png", dpi=160)
     print(f"saved {args.out}.png  (success={succ}, fail={fail}"
           f"{', +source ep3' if args.include_source else ''})")
