@@ -64,7 +64,13 @@ def read_base_frames(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--videos-dir", required=True, help="dir with episode_<N>.mp4")
-    ap.add_argument("--goal", required=True, help="episode-3 goal image")
+    ap.add_argument("--goal-from-episode", type=int, default=3,
+                    help="V3 (correct): use the LAST base-cam frame of episode_<N>.mp4 as the goal, "
+                         "so goal and observations share the SAME render pipeline. Default 3.")
+    ap.add_argument("--goal", default=None,
+                    help="V2 pitfall: an EXTERNAL goal image file. A separately-rendered image "
+                         "(e.g. *_external_cam.png) sits in a different render domain and pins every "
+                         "distance ~0.67 (flat) -> use --goal-from-episode instead. Overrides it if set.")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--success", default="2,11,21", help="comma list of SUCCESS episode indices (exclude 3)")
     ap.add_argument("--fail", default="6,26,47", help="comma list of FAIL episode indices")
@@ -87,11 +93,22 @@ def main():
     tokens_per_frame = int((256 // encoder.patch_size) ** 2)
     transform = build_transform()
 
-    gbgr = cv2.imread(str(args.goal))
-    if gbgr is None:
-        raise FileNotFoundError(f"goal image not found: {args.goal}")
-    z_goal = encode_frame(encoder, transform, cv2.cvtColor(gbgr, cv2.COLOR_BGR2RGB),
-                          tokens_per_frame, device)
+    if args.goal is not None:
+        # V2 path: external goal image file (different render domain -> flat ~0.67).
+        gbgr = cv2.imread(str(args.goal))
+        if gbgr is None:
+            raise FileNotFoundError(f"goal image not found: {args.goal}")
+        goal_rgb = cv2.cvtColor(gbgr, cv2.COLOR_BGR2RGB)
+        print(f"GOAL = external file {args.goal}  (V2-style; expect all curves flat ~0.67)")
+    else:
+        # V3 path: last base-cam frame of the source episode's own video (same render pipeline).
+        src = Path(args.videos_dir) / f"episode_{args.goal_from_episode}.mp4"
+        if not src.exists():
+            raise FileNotFoundError(f"goal-source video not found: {src}")
+        goal_rgb = read_base_frames(src)[-1]
+        print(f"GOAL = last base-cam frame of {src.name}  (V3-style; expect ep"
+              f"{args.goal_from_episode} to descend, others flat)")
+    z_goal = encode_frame(encoder, transform, goal_rgb, tokens_per_frame, device)
 
     def curve(ep):
         vp = Path(args.videos_dir) / f"episode_{ep}.mp4"
