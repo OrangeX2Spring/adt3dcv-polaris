@@ -1,7 +1,5 @@
 from collections.abc import Sequence
-import json
 import logging
-import os
 import pathlib
 import time
 from typing import Any, TypeAlias
@@ -12,26 +10,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from openpi_client import base_policy as _base_policy
-from vjepa2.FK import PandaFK
-from vjepa2 import rollout
 import torch
-from torch.nn import functional as F
 from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
-from vjepa2 import FK, rollout
-import torchvision.transforms as T
-import cv2
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
 
 class Policy(BasePolicy):
-    """Wraps a pi0.5 policy with V-JEPA AC predictor for action selection via energy minimization."""
-
     def __init__(
         self,
         model: _model.BaseModel,
@@ -41,10 +31,22 @@ class Policy(BasePolicy):
         output_transforms: Sequence[_transforms.DataTransformFn] = (),
         sample_kwargs: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
-        pytorch_device: str = "cuda:0",
+        pytorch_device: str = "cpu",
         is_pytorch: bool = False,
-        goal_image_path: str | pathlib.Path | None = None,
     ):
+        """Initialize the Policy.
+
+        Args:
+            model: The model to use for action sampling.
+            rng: Random number generator key for JAX models. Ignored for PyTorch models.
+            transforms: Input data transformations to apply before inference.
+            output_transforms: Output data transformations to apply after inference.
+            sample_kwargs: Additional keyword arguments to pass to model.sample_actions.
+            metadata: Additional metadata to store with the policy.
+            pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda:0").
+                          Only relevant when is_pytorch=True.
+            is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
+        """
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
@@ -52,12 +54,7 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
-        self._vjepa_device = torch.device(
-            pytorch_device or ("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        logging.info("Using V-JEPA device: %s", self._vjepa_device)
-        self._num_candidates = 10
-        self._robot = PandaFK(device=str(self._vjepa_device))
+
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
             self._model.eval()
@@ -67,86 +64,18 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
-        self._encoder, self._predictor = torch.hub.load("facebookresearch/vjepa2", "vjepa2_ac_vit_giant", pretrained=False)
-        ckpt= torch.load("/workspace/polaris/third_party/vjepa2/checkpoints/vjepa2-ac-vitg.pt", map_location="cpu")
-        def strip_module_prefix(state_dict):
-            return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
-
-        self._encoder.load_state_dict(strip_module_prefix(ckpt["encoder"]))
-        self._predictor.load_state_dict(strip_module_prefix(ckpt["predictor"]))
-        self._encoder = self._encoder.to(self._vjepa_device).eval()
-        self._predictor = self._predictor.to(self._vjepa_device).eval()
-        # Initialize transform
-        crop_size = 256
-        self._tokens_per_frame = int((crop_size // self._encoder.patch_size) ** 2)
-        self._transform = T.Compose([
-            T.ToPILImage(),
-            T.Resize((256, 256)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]),
-        ])
-        self._goal_image_path = pathlib.Path(goal_image_path or "last_frame.jpg").expanduser()
-        self._z_goal = self._encode_goal_image()
-
-        # Per-step energy log (JSONL). Override location with VJEPA_ENERGY_LOG.
-        self._energy_log_path = pathlib.Path(
-            os.environ.get(
-                "VJEPA_ENERGY_LOG",
-                f"vjepa_energy_{time.strftime('%Y%m%d_%H%M%S')}.jsonl",
-            )
-        ).expanduser()
-        self._infer_step = 0
-        logging.info("Logging V-JEPA energies to %s", self._energy_log_path.resolve())
-
-    def _encode_goal_image(self) -> torch.Tensor:
-        goal_frame = cv2.imread(str(self._goal_image_path))
-        if goal_frame is None:
-            raise FileNotFoundError(
-                f"Could not read V-JEPA goal image at {self._goal_image_path}. "
-                "Pass --goal-image-path to scripts/serve_policy.py with an existing image path."
-            )
-        goal_frame = self._transform(cv2.cvtColor(goal_frame, cv2.COLOR_BGR2RGB))
-        goal_np = np.stack([goal_frame, goal_frame], axis=0)
-        goal_np = np.expand_dims(goal_np, axis=0)
-        goal_tensor = (
-            torch.from_numpy(goal_np)
-            .float()
-            .permute(0, 2, 1, 3, 4)
-            .to(self._vjepa_device)
-        )
-        with torch.inference_mode():
-            h = self._encoder(goal_tensor)[:, -self._tokens_per_frame :, :]
-            # Match official WorldModel.encode: reps are layer-normed before use
-            return F.layer_norm(h, (h.size(-1),))
-
-            
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
-            inputs = jax.tree.map(
-                lambda x: jnp.repeat(
-                    jnp.asarray(x)[None, ...],
-                    self._num_candidates,
-                    axis=0,
-                ),
-                inputs,
-            )
+            inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
             # Convert inputs to PyTorch tensors and move to correct device
-            inputs = jax.tree.map(
-                    lambda x: (
-                        torch.from_numpy(np.asarray(x))
-                        .to(self._pytorch_device)
-                        .unsqueeze(0)
-                        .repeat(self._num_candidates, *([1] * np.asarray(x).ndim))
-                    ),
-                    inputs,
-                )
+            inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
         # Prepare kwargs for sample_actions
@@ -155,12 +84,7 @@ class Policy(BasePolicy):
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
-                if noise.ndim == 2:
-                    noise = jnp.repeat(
-                        noise[None, ...],
-                        self._num_candidates,
-                        axis=0,
-                    )
+                noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
@@ -169,81 +93,6 @@ class Policy(BasePolicy):
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
-
-        actions_joint = outputs["actions"][:,:,:8]  # (num_candidates, action_horizon, action_dim)
-        # A2: sample 4 frames ~0.27s apart (16-step chunk at 15Hz) so each V-JEPA action
-        # spans ~one DROID 4fps step (~0.25s), matching the predictor's training granularity.
-        # Previously [7, 15] gave 2 steps of ~0.53s each (~2x training magnitude, OOD).
-        actions_joint_downsampled = actions_joint[:, [3, 7, 11, 15], :]  # (10, 4, 8)
-
-        state_joint = outputs["state"][:,:8]
-        curr_state_np = np.array(state_joint)      # (10, 8)
-        future_action_np = np.array(actions_joint_downsampled)  # (10, 4, 8)
-
-        # 2. 给当前帧状态插入时序维度 (Time Dimension)
-        # 从 (10, 8) 变成 (10, 1, 8)，代表 t0 帧
-        curr_state_expanded = curr_state_np[:, np.newaxis, :]
-
-        # 3. 沿时序轴（axis=1）无缝拼接，组合成长为 T=5 的完整轨迹序列
-        # [t0] + [t1..t4] = [t0, t1, t2, t3, t4]
-        full_trajectory = np.concatenate([curr_state_expanded, future_action_np], axis=1) # Shape: (10, 5, 8)
-
-        result = self._robot.convert_trajectory(full_trajectory)
-        ee_actions = torch.from_numpy(result["actions"]).float().to(self._vjepa_device)
-        ee_states = torch.from_numpy(result["states"]).float().to(self._vjepa_device)
-        
-        if self._encoder is not None:
-            # A1: encode the RAW uint8 camera frame (RGB, H,W,C), matching the goal-image
-            # path exactly. openpi's pipeline has already mapped observation.images to
-            # [-1,1] float; feeding that to self._transform's ToPILImage (which assumes
-            # [0,1]) wraps negative pixels and corrupts the current-frame embedding.
-            raw_base = np.asarray(obs["observation/exterior_image_1_left"])
-            if np.issubdtype(raw_base.dtype, np.floating):
-                raw_base = (255 * raw_base).astype(np.uint8)
-            if raw_base.shape[0] == 3:  # C,H,W -> H,W,C
-                raw_base = np.transpose(raw_base, (1, 2, 0))
-            frame = self._transform(raw_base)
-            frames_np = np.stack([frame, frame], axis=0)  # (2, 256, 256, 3)
-            frames_np = np.expand_dims(frames_np, axis=0)
-            frames_tensor = (
-                torch.from_numpy(frames_np)
-                .float()
-                .permute(0, 2, 1, 3, 4)
-                .to(self._vjepa_device)
-            )
-
-            with torch.inference_mode():
-                z_current = self._encoder(frames_tensor)[:, -self._tokens_per_frame :, :]
-                z_current = F.layer_norm(z_current, (z_current.size(-1),))
-                z_hat = rollout.forward_actions(z_current, self._predictor, ee_states, ee_actions)
-                losses = rollout.loss_fn(z_hat, self._z_goal)  # list[10]
-            best_idx = np.argmin(losses)
-            logging.info(
-                "V-JEPA energies: min=%.4f max=%.4f spread=%.4f best_idx=%d all=%s",
-                min(losses), max(losses), max(losses) - min(losses), best_idx,
-                [round(l, 4) for l in losses],
-            )
-            with self._energy_log_path.open("a") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "wall_time": time.time(),
-                            "step": self._infer_step,
-                            "best_idx": int(best_idx),
-                            "energies": [round(l, 6) for l in losses],
-                        }
-                    )
-                    + "\n"
-                )
-            self._infer_step += 1
-
-            best_action = outputs["actions"][best_idx]  # (7,) delta EE
-            
-
-            outputs = {
-                "state": inputs["state"][0][None, ...],
-                "actions": best_action[None, ...],
-            }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
@@ -255,7 +104,7 @@ class Policy(BasePolicy):
             "infer_ms": model_time * 1000,
         }
         return outputs
-    
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
