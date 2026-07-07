@@ -69,9 +69,20 @@ def main(eval_args: EvalArgs):
     language_instruction, initial_conditions = load_eval_initial_conditions(
         usd=env.usd_file,
         initial_conditions_file=eval_args.initial_conditions_file,
-        rollouts=eval_args.rollouts,
+        # With --fix-ic, keep ALL ICs loaded (rollouts would truncate the list and any
+        # fix_ic >= rollouts would go out of range); rollouts then means "number of repeats".
+        rollouts=None if eval_args.fix_ic is not None else eval_args.rollouts,
     )
-    rollouts = len(initial_conditions)
+    if eval_args.fix_ic is not None:
+        if not 0 <= eval_args.fix_ic < len(initial_conditions):
+            raise ValueError(
+                f"--fix-ic {eval_args.fix_ic} out of range (0..{len(initial_conditions) - 1})"
+            )
+        if eval_args.rollouts is None:
+            raise ValueError("--fix-ic requires --rollouts (number of repeats)")
+        rollouts = eval_args.rollouts
+    else:
+        rollouts = len(initial_conditions)
 
     # Optional instrumentation (CLI-flag gated; strict no-op unless the flags are passed):
     #   --fix-ic <idx>  -> use this SAME initial-condition index for every rollout
