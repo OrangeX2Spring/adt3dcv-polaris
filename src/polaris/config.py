@@ -58,6 +58,8 @@ class EvalArgs:
     goal_frame_when: str = "success"  # success, final, or both
     fix_ic: int | None = None  # if set, use this SAME initial-condition index for every rollout
     step_log: bool = False  # dump per-step progress + checker _ever flags to episode_<k>_steps.jsonl
+    send_subtask_state: bool = False  # send IC index + rubric done-mask to the policy server
+    # (for the subtask verifier's oracle goal switching; requires the DroidJointPos client)
 
 
 @dataclass

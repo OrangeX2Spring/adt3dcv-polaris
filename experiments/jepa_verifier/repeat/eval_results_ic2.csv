@@ -1,0 +1,11 @@
+episode,episode_length,success,progress,r_c0_reach_ice_cream_ever,r_c0_reach_ice_cream_skipped,r_c1_reach_grapes_ever,r_c1_reach_grapes_skipped,r_c2_lift_ice_cream_ever,r_c2_lift_ice_cream_skipped,r_c3_lift_grapes_ever,r_c3_lift_grapes_skipped,r_c4_inside_ice_cream__bowl_ever,r_c4_inside_ice_cream__bowl_skipped,r_c5_inside_grapes_bowl_ever,r_c5_inside_grapes_bowl_skipped,r_c5_inside_grapes_bowl_finger_joint,r_c5_inside_grapes_bowl_overlap_ratio,r_c5_inside_grapes_bowl_centroid_inside,r_done,r_total,r_c4_inside_ice_cream__bowl_finger_joint,r_c4_inside_ice_cream__bowl_overlap_ratio,r_c4_inside_ice_cream__bowl_centroid_inside
+0,450,False,0.5,0.0,0.0,1.0,0.0,0.0,1.0,1.0,0.0,0.0,1.0,1.0,0.0,0.0,0.0,0.0,3.0,6.0,,,
+1,450,True,1.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,0.0,0.0,0.0,6.0,6.0,0.0,0.0,0.0
+2,450,False,0.5,1.0,0.0,1.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,,,,3.0,6.0,0.0,0.0,0.0
+3,450,False,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,,,,0.0,6.0,,,
+4,450,False,0.5,1.0,0.0,1.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,,,,3.0,6.0,0.0,0.0,0.0
+5,450,False,0.8333333333333334,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,5.0,6.0,0.0,0.0,0.0
+6,450,True,1.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,0.0,0.0,0.0,6.0,6.0,0.0,0.0,0.0
+7,450,False,0.8333333333333334,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,5.0,6.0,0.0,0.0,0.0
+8,450,False,0.5,0.0,0.0,1.0,0.0,0.0,1.0,1.0,0.0,0.0,1.0,1.0,0.0,0.0,0.0,0.0,3.0,6.0,,,
+9,450,False,0.3333333333333333,1.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,1.0,,,,2.0,6.0,,,

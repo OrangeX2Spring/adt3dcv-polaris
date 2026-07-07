@@ -93,6 +93,19 @@ def main(eval_args: EvalArgs):
     _step_log = eval_args.step_log
     step_records: list[dict] = []
 
+    _STAGE_KEYS = [
+        "c0_reach_ice_cream", "c1_reach_grapes", "c2_lift_ice_cream",
+        "c3_lift_grapes", "c4_inside_ice_cream__bowl", "c5_inside_grapes_bowl",
+    ]
+
+    def _subtask_state(ep: int, latest_info) -> dict:
+        """IC index + rubric done-mask for the subtask verifier's oracle goal switching."""
+        metrics = (latest_info or {}).get("rubric", {}).get("metrics", {})
+        return {
+            "ic_index": int(_fix_ic) if _fix_ic is not None else ep % len(initial_conditions),
+            "done": [bool(metrics.get(f"{k}_ever", False)) for k in _STAGE_KEYS],
+        }
+
     def _reset_positions(ep: int):
         idx = _fix_ic if _fix_ic is not None else ep % len(initial_conditions)
         tag = "  (pinned via --fix-ic)" if _fix_ic is not None else ""
@@ -135,7 +148,12 @@ def main(eval_args: EvalArgs):
     success_goal_frame_saved = False
     print(f" >>> Starting eval job from episode {episode + 1} of {rollouts} <<< ")
     while True:
-        action, viz = policy_client.infer(obs, language_instruction)
+        if eval_args.send_subtask_state:
+            action, viz = policy_client.infer(
+                obs, language_instruction, subtask_state=_subtask_state(episode, info)
+            )
+        else:
+            action, viz = policy_client.infer(obs, language_instruction)
         if viz is not None:
             video.append(viz)
         obs, rew, term, trunc, info = env.step(

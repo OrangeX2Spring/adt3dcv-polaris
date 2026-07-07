@@ -40,7 +40,11 @@ class DroidJointPosClient(InferenceClient):
         self.pred_action_chunk = None
 
     def infer(
-        self, obs: dict, instruction: str, return_viz: bool = False
+        self,
+        obs: dict,
+        instruction: str,
+        return_viz: bool = False,
+        subtask_state: dict | None = None,
     ) -> tuple[np.ndarray, np.ndarray | None]:
         """
         Infer the next action from the policy in a server-client setup
@@ -65,6 +69,10 @@ class DroidJointPosClient(InferenceClient):
                 "observation/gripper_position": curr_obs["gripper_position"],
                 "prompt": instruction,
             }
+            if subtask_state is not None:
+                # For the subtask verifier (policy_subtask.py): oracle goal switching.
+                request_data["subtask/ic_index"] = int(subtask_state["ic_index"])
+                request_data["subtask/done"] = [bool(b) for b in subtask_state["done"]]
             server_response = self.client.infer(request_data)
             self.pred_action_chunk = server_response["actions"]
             both = np.concatenate([exterior_image, wrist_image], axis=1)
