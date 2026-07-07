@@ -279,3 +279,6 @@ third_party/openpi/vjepa_energy_*.jsonl
 # macOS system files
 .DS_Store
 **/.DS_Store
+
+# Claude Code local settings
+.claude/

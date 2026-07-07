@@ -48,8 +48,17 @@ def main():
     ap.add_argument("--prefix", default="repeat_ic")
     args = ap.parse_args()
 
-    folders = sorted(Path(args.runs_root).glob(f"{args.prefix}*"),
+    root = Path(args.runs_root)
+    folders = sorted(root.glob(f"{args.prefix}*"),
                      key=lambda p: int(re.sub(r"\D", "", p.name) or -1))
+    if not folders:
+        print(f"!! no folders matching '{args.prefix}*' under {root}")
+        print(f"   what's actually there: {[p.name for p in sorted(root.iterdir())] if root.exists() else 'ROOT DOES NOT EXIST'}")
+        return
+    print(f"found {len(folders)} folders: {[p.name for p in folders]}")
+    missing = [p.name for p in folders if not (p / 'eval_results.csv').exists()]
+    if missing:
+        print(f"!! {len(missing)} folders have NO eval_results.csv yet (crashed or not started): {missing}")
     print(f"{'IC':>3} {'cat':>10} {'n':>3} {'succ':>6} {'prog mean(min-max)':>20}  stalls")
     borderline = []
     for f in folders:
