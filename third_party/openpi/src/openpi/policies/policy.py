@@ -116,6 +116,9 @@ class Policy(BasePolicy):
 
         self._spread_gate = float(os.environ.get("VJEPA_SPREAD_GATE", 0.02))
         self._shadow = os.environ.get("VJEPA_SHADOW", "0") == "1"
+        # VJEPA_LOG_ACTIONS=1 -> also log each candidate's EE actions + the context pose
+        # per step (for the action-contrast / candidate-diversity analysis).
+        self._log_actions = os.environ.get("VJEPA_LOG_ACTIONS", "0") == "1"
         self._energy_log_path = pathlib.Path(
             os.environ.get(
                 "VJEPA_ENERGY_LOG", f"vjepa_subtask_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
@@ -253,6 +256,9 @@ class Policy(BasePolicy):
                 executed_idx=executed_idx,
                 shadow=self._shadow,
             )
+            if self._log_actions:
+                log["ee_pose0"] = np.round(result["states"][0, 0], 5).tolist()
+                log["cand_ee_actions"] = np.round(result["actions"], 5).tolist()
             logging.info(
                 "subtask=%d spread=%.4f gated=%s best=%d exec=%d",
                 active, spread, gated, best_idx, executed_idx,
