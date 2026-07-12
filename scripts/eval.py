@@ -2,6 +2,7 @@ import tyro
 import mediapy
 
 # import wandb
+import json
 import tqdm
 import gymnasium as gym
 import torch
@@ -46,9 +47,41 @@ def main(eval_args: EvalArgs):
     language_instruction, initial_conditions = load_eval_initial_conditions(
         usd=env.usd_file,
         initial_conditions_file=eval_args.initial_conditions_file,
-        rollouts=eval_args.rollouts,
+        # With --fix-ic, keep ALL ICs loaded (rollouts would truncate the list and any
+        # fix_ic >= rollouts would go out of range); rollouts then means "number of repeats".
+        rollouts=None if eval_args.fix_ic is not None else eval_args.rollouts,
     )
-    rollouts = len(initial_conditions)
+    if eval_args.fix_ic is not None:
+        if not 0 <= eval_args.fix_ic < len(initial_conditions):
+            raise ValueError(
+                f"--fix-ic {eval_args.fix_ic} out of range (0..{len(initial_conditions) - 1})"
+            )
+        if eval_args.rollouts is None:
+            raise ValueError("--fix-ic requires --rollouts (number of repeats)")
+        rollouts = eval_args.rollouts
+    else:
+        rollouts = len(initial_conditions)
+
+    def _reset_positions(ep: int):
+        idx = eval_args.fix_ic if eval_args.fix_ic is not None else ep % len(initial_conditions)
+        tag = "  (pinned via --fix-ic)" if eval_args.fix_ic is not None else ""
+        print(f"[eval] rollout uses initial-condition index {idx}{tag}")
+        return initial_conditions[idx]
+
+    _STAGE_KEYS = [
+        "c0_reach_ice_cream", "c1_reach_grapes", "c2_lift_ice_cream",
+        "c3_lift_grapes", "c4_inside_ice_cream__bowl", "c5_inside_grapes_bowl",
+    ]
+
+    def _subtask_state(ep: int, latest_info) -> dict:
+        """IC index + rubric done-mask for the subtask verifier's oracle goal switching."""
+        metrics = (latest_info or {}).get("rubric", {}).get("metrics", {})
+        return {
+            "ic_index": eval_args.fix_ic if eval_args.fix_ic is not None else ep % len(initial_conditions),
+            "done": [bool(metrics.get(f"{k}_ever", False)) for k in _STAGE_KEYS],
+        }
+
+    step_records: list[dict] = []
     # Resume CSV logging
     run_folder = Path(eval_args.run_folder)
     run_folder.mkdir(parents=True, exist_ok=True)
@@ -77,17 +110,35 @@ def main(eval_args: EvalArgs):
     horizon = env.max_episode_length
     bar = tqdm.tqdm(range(horizon))
     obs, info = env.reset(
-        object_positions=initial_conditions[episode % len(initial_conditions)]
+        object_positions=_reset_positions(episode)
     )
     policy_client.reset()
     print(f" >>> Starting eval job from episode {episode + 1} of {rollouts} <<< ")
     while True:
-        action, viz = policy_client.infer(obs, language_instruction)
+        if eval_args.send_subtask_state:
+            action, viz = policy_client.infer(
+                obs, language_instruction, subtask_state=_subtask_state(episode, info)
+            )
+        else:
+            action, viz = policy_client.infer(obs, language_instruction)
         if viz is not None:
             video.append(viz)
         obs, rew, term, trunc, info = env.step(
             torch.tensor(action).reshape(1, -1), expensive=policy_client.rerender
         )
+        if eval_args.step_log:
+            step_records.append(
+                {
+                    "step": bar.n,
+                    "frame": max(0, len(video) - 1),
+                    "progress": float(info["rubric"]["progress"]),
+                    **{
+                        k: bool(v)
+                        for k, v in info["rubric"]["metrics"].items()
+                        if k.endswith("_ever")
+                    },
+                }
+            )
 
         bar.update(1)
         if term[0] or trunc[0] or bar.n >= horizon:
@@ -97,6 +148,12 @@ def main(eval_args: EvalArgs):
             filename = run_folder / f"episode_{episode}.mp4"
             mediapy.write_video(filename, video, fps=15)
 
+            if eval_args.step_log and step_records:
+                (run_folder / f"episode_{episode}_steps.jsonl").write_text(
+                    "\n".join(json.dumps(r) for r in step_records)
+                )
+                step_records = []
+
             # Log episode results to CSV
             episode_data = {
                 "episode": episode,
@@ -104,6 +161,11 @@ def main(eval_args: EvalArgs):
                 "success": info["rubric"]["success"],
                 "progress": info["rubric"]["progress"],
             }
+            # Per-checker metrics (r_c*_ever columns; summarize_repeats.py needs them
+            # for the failure-stage histogram).
+            episode_data.update(
+                {f"r_{key}": value for key, value in info["rubric"]["metrics"].items()}
+            )
             episode_df = pd.concat(
                 [episode_df, pd.DataFrame([episode_data])], ignore_index=True
             )
@@ -113,7 +175,7 @@ def main(eval_args: EvalArgs):
             print(f"Episode {episode} finished. Episode length: {bar.n}")
             bar = tqdm.tqdm(range(horizon))
             obs, info = env.reset(
-                object_positions=initial_conditions[episode % len(initial_conditions)]
+                object_positions=_reset_positions(episode)
             )
 
             episode += 1

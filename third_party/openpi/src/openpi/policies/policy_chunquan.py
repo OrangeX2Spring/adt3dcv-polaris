@@ -162,6 +162,7 @@ class Policy(BasePolicy):
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:
         # Subtask state from eval (pop BEFORE transforms so pi0.5's pipeline never sees it).
+        obs.pop("_episode_reset", None)  # sent unconditionally by the client (used by the goal-seq policy); must not reach pi0.5 transforms
         ic_index = obs.pop("subtask/ic_index", None)
         done = obs.pop("subtask/done", None)  # list of 6 bools, c0..c5
 
