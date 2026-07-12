@@ -38,6 +38,7 @@ class DroidJointPosClient(InferenceClient):
     def reset(self):
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk = None
+        self._pending_episode_reset = True
 
     def infer(
         self,
@@ -68,7 +69,9 @@ class DroidJointPosClient(InferenceClient):
                 "observation/joint_position": curr_obs["joint_position"],
                 "observation/gripper_position": curr_obs["gripper_position"],
                 "prompt": instruction,
+                "_episode_reset": self._pending_episode_reset,
             }
+            self._pending_episode_reset = False
             if subtask_state is not None:
                 # For the subtask verifier (policy_subtask.py): oracle goal switching.
                 request_data["subtask/ic_index"] = int(subtask_state["ic_index"])
