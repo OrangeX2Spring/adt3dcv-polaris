@@ -15,7 +15,8 @@ It is a drop-in policy.py variant:
     fresh jitter each attempt so retries after a failed grasp are not identical
 
 Tuning via env vars (meters / radians / steps):
-  EXPERT_GRASP_OFFSET (0.02)  height above object-center z at the grasp waypoint
+  EXPERT_TCP_OFFSET (0.105)   flange-to-fingertip distance (FK ends at panda_link8!)
+  EXPERT_GRASP_OFFSET (0.02)  fingertip height above object-center z at the grasp waypoint
   EXPERT_HOVER (0.12)  EXPERT_TRANSIT (0.20)  EXPERT_DROP (0.12)   relative heights
   EXPERT_DWELL (10)    steps to hold still while the gripper closes/opens
   EXPERT_MAX_DQ (0.05) max joint delta per control step (speed cap)
@@ -71,6 +72,11 @@ class Policy(BasePolicy):
         self._poses: list[dict] = data["poses"]
         self._robot = PandaFK(device="cpu")
 
+        # PandaFK's chain ends at panda_link8 (the wrist flange); the fingertips sit
+        # ~10.5 cm further along the tool axis. Waypoints are specified for the
+        # FINGERTIPS; this offset lifts the flange target accordingly (world z,
+        # valid for the near-vertical tool orientation of the DROID home pose).
+        self._tcp = float(os.environ.get("EXPERT_TCP_OFFSET", 0.105))
         self._grasp_off = float(os.environ.get("EXPERT_GRASP_OFFSET", 0.02))
         self._hover = float(os.environ.get("EXPERT_HOVER", 0.12))
         self._transit = float(os.environ.get("EXPERT_TRANSIT", 0.20))
@@ -130,7 +136,8 @@ class Policy(BasePolicy):
         rows: list[np.ndarray] = []
         q_prev = np.asarray(q0, dtype=np.float32)
         for xyz, grip, dwell in wps:
-            target6 = np.concatenate([np.asarray(xyz, dtype=np.float32), rpy])
+            xyz = np.asarray(xyz, dtype=np.float32) + [0.0, 0.0, self._tcp]  # fingertip -> flange
+            target6 = np.concatenate([xyz, rpy])
             q_t = np.asarray(self._robot.ik(target6, q_prev), dtype=np.float32)
             n = max(int(np.ceil(np.max(np.abs(q_t - q_prev)) / self._max_dq)), 1)
             for a in np.linspace(1.0 / n, 1.0, n):
