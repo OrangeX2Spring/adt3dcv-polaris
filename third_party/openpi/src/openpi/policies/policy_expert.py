@@ -78,6 +78,11 @@ class Policy(BasePolicy):
         # valid for the near-vertical tool orientation of the DROID home pose).
         self._tcp = float(os.environ.get("EXPERT_TCP_OFFSET", 0.105))
         self._grasp_off = float(os.environ.get("EXPERT_GRASP_OFFSET", 0.02))
+        # grapes lie tilted with a lower center (z~0.036 vs ice cream ~0.051) — allow a
+        # separate grasp height; defaults to the shared offset if unset
+        self._grasp_off_grapes = float(
+            os.environ.get("EXPERT_GRASP_OFFSET_GRAPES", self._grasp_off)
+        )
         self._hover = float(os.environ.get("EXPERT_HOVER", 0.12))
         self._transit = float(os.environ.get("EXPERT_TRANSIT", 0.20))
         self._drop = float(os.environ.get("EXPERT_DROP", 0.12))
@@ -117,20 +122,33 @@ class Policy(BasePolicy):
 
         p0 = self._robot.state(np.concatenate([q0, [grip0]]).astype(np.float32))
         rpy = np.asarray(p0[3:6], dtype=np.float32)  # keep initial EE orientation everywhere
+        logging.info(
+            "expert targets: ice=%s grapes=%s bowl=%s | ee0(flange)=%s | ic_keys=%s",
+            np.round(ice, 3).tolist(), np.round(grapes, 3).tolist(),
+            np.round(bowl, 3).tolist(), np.round(np.asarray(p0[:3]), 3).tolist(),
+            list(ic.keys()),
+        )
 
-        # (xyz, gripper, dwell_steps) waypoint list
+        # (xyz, gripper, dwell_steps) waypoint list. Drop points are spread laterally per
+        # food (else food #2 is released onto food #1 and bounces out of the bowl) —
+        # same trick as generate_goal_images.py's xy_spread.
+        spread = float(os.environ.get("EXPERT_DROP_SPREAD", 0.02))
         wps: list[tuple[np.ndarray, float, int]] = []
-        for food in (ice, grapes):
+        for food, g_off, dx in (
+            (ice, self._grasp_off, -spread),
+            (grapes, self._grasp_off_grapes, +spread),
+        ):
             f = food + jit()
+            drop = bowl + [dx, 0.0, 0.0]
             wps += [
                 (f + [0, 0, self._hover], self._open, 0),
-                (f + [0, 0, self._grasp_off], self._open, 0),
-                (f + [0, 0, self._grasp_off], self._closed, self._dwell),   # close & dwell
+                (f + [0, 0, g_off], self._open, 0),
+                (f + [0, 0, g_off], self._closed, self._dwell),   # close & dwell
                 (f + [0, 0, self._transit], self._closed, 0),                # lift
-                (bowl + [0, 0, self._transit], self._closed, 0),             # transit
-                (bowl + [0, 0, self._drop], self._closed, 0),                # lower
-                (bowl + [0, 0, self._drop], self._open, self._dwell),        # release & dwell
-                (bowl + [0, 0, self._transit], self._open, 0),               # retreat
+                (drop + [0, 0, self._transit], self._closed, 0),             # transit
+                (drop + [0, 0, self._drop], self._closed, 0),                # lower
+                (drop + [0, 0, self._drop], self._open, self._dwell),        # release & dwell
+                (drop + [0, 0, self._transit], self._open, 0),               # retreat
             ]
 
         # Insert via-points so every IK hop stays short: the DLS IK in FK.py is built for
