@@ -133,12 +133,44 @@ class Policy(BasePolicy):
                 (bowl + [0, 0, self._transit], self._open, 0),               # retreat
             ]
 
+        # Insert via-points so every IK hop stays short: the DLS IK in FK.py is built for
+        # small deltas and can stall (silently returning ~the warm start) on long
+        # cross-table jumps — which turns a whole leg of the plan into a no-op.
+        expanded: list[tuple[np.ndarray, float, int]] = []
+        prev_xyz = np.asarray(p0[:3], dtype=np.float32) - [0.0, 0.0, self._tcp]
+        for xyz, grip, dwell in wps:
+            xyz = np.asarray(xyz, dtype=np.float32)
+            n_via = int(np.linalg.norm((xyz - prev_xyz)[:2]) // 0.15)
+            for v in range(1, n_via + 1):
+                mid = prev_xyz + (xyz - prev_xyz) * v / (n_via + 1)
+                mid[2] = max(prev_xyz[2], xyz[2])
+                expanded.append((mid, grip, 0))
+            expanded.append((xyz, grip, dwell))
+            prev_xyz = xyz
+
+        def _solve(target6, q_init, q_home):
+            best_q, best_err = None, np.inf
+            for q_seed, iters in ((q_init, 120), (q_home, 200)):
+                q = np.asarray(self._robot.ik(target6, q_seed, iters=iters), dtype=np.float32)
+                fk = np.asarray(self._robot.state(np.concatenate([q, [0.0]]).astype(np.float32)))
+                err = float(np.linalg.norm(fk[:3] - target6[:3]))
+                if err < best_err:
+                    best_q, best_err = q, err
+                if err < 0.015:
+                    break
+            return best_q, best_err
+
         rows: list[np.ndarray] = []
         q_prev = np.asarray(q0, dtype=np.float32)
-        for xyz, grip, dwell in wps:
+        for wi, (xyz, grip, dwell) in enumerate(expanded):
             xyz = np.asarray(xyz, dtype=np.float32) + [0.0, 0.0, self._tcp]  # fingertip -> flange
             target6 = np.concatenate([xyz, rpy])
-            q_t = np.asarray(self._robot.ik(target6, q_prev), dtype=np.float32)
+            q_t, err = _solve(target6, q_prev, np.asarray(q0, dtype=np.float32))
+            if err > 0.02:
+                logging.warning(
+                    "expert IK poor convergence at waypoint %d: err=%.3f m target=%s",
+                    wi, err, np.round(target6[:3], 3).tolist(),
+                )
             n = max(int(np.ceil(np.max(np.abs(q_t - q_prev)) / self._max_dq)), 1)
             for a in np.linspace(1.0 / n, 1.0, n):
                 rows.append(np.concatenate([q_prev + a * (q_t - q_prev), [grip]]))
