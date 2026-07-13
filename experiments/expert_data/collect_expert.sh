@@ -5,6 +5,7 @@
 #
 # Usage:  bash experiments/expert_data/collect_expert.sh [first_ic] [last_ic]
 set -u
+trap 'echo; echo "[collect] interrupted by user, exiting"; exit 130' INT TERM
 FIRST=${1:-0}
 LAST=${2:-99}
 STAGING=/workspace/polaris/runs/expert_staging
@@ -26,7 +27,9 @@ for ic in $(seq "$FIRST" "$LAST"); do
         --rollouts 1 --fix-ic "$ic" --send-subtask-state \
         --record-traj "$STAGING" \
         --run-folder "$folder"
-    if grep -qi true "$folder/eval_results.csv"; then
+    result=$(tail -1 "$folder/eval_results.csv" 2>/dev/null | cut -d, -f3,4)
+    echo "[collect] IC $ic attempt $attempt -> success,progress = ${result:-NO CSV}"
+    if grep -qi true "$folder/eval_results.csv" 2>/dev/null; then
       echo "[collect] IC $ic SUCCESS on attempt $attempt"
       ok=1
       break

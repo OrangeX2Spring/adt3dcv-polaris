@@ -116,12 +116,13 @@ class Policy(BasePolicy):
         rng = np.random.default_rng(1000 * ic_index + self._attempt)
         jit = lambda: rng.uniform(-self._jitter, self._jitter, size=3) * [1, 1, 0.6]
 
-        ice = self._find(ic, "ice_cream")[:3]
-        grapes = self._find(ic, "grapes")[:3]
+        ice_full = self._find(ic, "ice_cream")
+        grapes_full = self._find(ic, "grapes")
+        ice, grapes = ice_full[:3], grapes_full[:3]
         bowl = self._find(ic, "bowl")[:3]
 
         p0 = self._robot.state(np.concatenate([q0, [grip0]]).astype(np.float32))
-        rpy = np.asarray(p0[3:6], dtype=np.float32)  # keep initial EE orientation everywhere
+        rpy = np.asarray(p0[3:6], dtype=np.float32)  # home EE orientation (transit/default)
         logging.info(
             "expert targets: ice=%s grapes=%s bowl=%s | ee0(flange)=%s | ic_keys=%s",
             np.round(ice, 3).tolist(), np.round(grapes, 3).tolist(),
@@ -129,41 +130,90 @@ class Policy(BasePolicy):
             list(ic.keys()),
         )
 
-        # (xyz, gripper, dwell_steps) waypoint list. Drop points are spread laterally per
-        # food (else food #2 is released onto food #1 and bounces out of the bowl) —
-        # same trick as generate_goal_images.py's xy_spread.
+        # ---- grasp-yaw alignment + per-attempt sweep -------------------------------
+        # A fixed-orientation top-down pinch is pose-lottery: whether the fingers
+        # straddle the object's long axis depends on the object's per-IC yaw. We align
+        # the gripper to the long axis (from the IC quaternion, wxyz) and SWEEP an
+        # offset across retry attempts — one of the attempts straddles the axis even
+        # though the finger-frame calibration is unknown.
+        from scipy.spatial.transform import Rotation as _R
+
+        yaw_align = os.environ.get("EXPERT_YAW_ALIGN", "1") == "1"
+        SWEEP = [0.0, np.pi / 4, -np.pi / 4, np.pi / 2, np.pi / 8]
+        sweep = SWEEP[(self._attempt - 1) % len(SWEEP)]
+        logging.info(
+            "expert grasp yaw: align=%s sweep_offset=%.0f deg (attempt %d)",
+            yaw_align, np.degrees(sweep), self._attempt,
+        )
+        R0 = _R.from_euler("xyz", rpy)
+        close_dir = R0.apply([0.0, 1.0, 0.0])
+        phi0 = float(np.arctan2(close_dir[1], close_dir[0]))
+
+        def grasp_rpy(obj_pose7: np.ndarray) -> np.ndarray:
+            if not yaw_align:
+                return rpy
+            q = obj_pose7[3:7]  # wxyz -> scipy xyzw
+            Ro = _R.from_quat([q[1], q[2], q[3], q[0]])
+            ax, ay = Ro.apply([1.0, 0.0, 0.0]), Ro.apply([0.0, 1.0, 0.0])
+            a = ax if np.hypot(*ax[:2]) >= np.hypot(*ay[:2]) else ay
+            obj_yaw = float(np.arctan2(a[1], a[0]))
+            theta = (obj_yaw + np.pi / 2 + sweep) - phi0
+            theta = ((theta + np.pi / 2) % np.pi) - np.pi / 2  # pinch is 180deg-symmetric
+            Rg = _R.from_euler("z", theta) * R0
+            return Rg.as_euler("xyz").astype(np.float32)
+
+        # (xyz, rpy, gripper, dwell_steps) waypoint list. Drop points are spread
+        # laterally per food (else food #2 lands on food #1 and bounces out).
         spread = float(os.environ.get("EXPERT_DROP_SPREAD", 0.02))
-        wps: list[tuple[np.ndarray, float, int]] = []
-        for food, g_off, dx in (
-            (ice, self._grasp_off, -spread),
-            (grapes, self._grasp_off_grapes, +spread),
+        wps: list[tuple[np.ndarray, np.ndarray, float, int]] = []
+        clearance = float(os.environ.get("EXPERT_BOWL_CLEARANCE", 0.13))
+        for food_full, g_off, dx in (
+            (ice_full, self._grasp_off, -spread),
+            (grapes_full, self._grasp_off_grapes, +spread),
         ):
+            food = food_full[:3]
+            rpy_g = grasp_rpy(food_full)
             f = food + jit()
+            # If the food sits flush against the bowl, grasp its FAR side: shift the
+            # grasp point away from the bowl so the descending gripper never clips the
+            # bowl wall (which nudges the bowl and ruins the later drop coordinates).
+            away = f[:2] - bowl[:2]
+            d_bowl = float(np.linalg.norm(away))
+            if 1e-6 < d_bowl < clearance:
+                shift = min(clearance - d_bowl, 0.025)
+                f = f.copy()
+                f[:2] += away / d_bowl * shift
+                logging.info(
+                    "expert: food %.3f m from bowl -> grasp shifted %.3f m away from bowl",
+                    d_bowl, shift,
+                )
             drop = bowl + [dx, 0.0, 0.0]
+            # the aligned orientation is kept for the WHOLE leg (rotating the wrist
+            # mid-carry risks dropping the object)
             wps += [
-                (f + [0, 0, self._hover], self._open, 0),
-                (f + [0, 0, g_off], self._open, 0),
-                (f + [0, 0, g_off], self._closed, self._dwell),   # close & dwell
-                (f + [0, 0, self._transit], self._closed, 0),                # lift
-                (drop + [0, 0, self._transit], self._closed, 0),             # transit
-                (drop + [0, 0, self._drop], self._closed, 0),                # lower
-                (drop + [0, 0, self._drop], self._open, self._dwell),        # release & dwell
-                (drop + [0, 0, self._transit], self._open, 0),               # retreat
+                (f + [0, 0, self._hover], rpy_g, self._open, 0),
+                (f + [0, 0, g_off], rpy_g, self._open, 0),
+                (f + [0, 0, g_off], rpy_g, self._closed, self._dwell),   # close & dwell
+                (f + [0, 0, self._transit], rpy_g, self._closed, 0),                # lift
+                (drop + [0, 0, self._transit], rpy_g, self._closed, 0),             # transit
+                (drop + [0, 0, self._drop], rpy_g, self._closed, 0),                # lower
+                (drop + [0, 0, self._drop], rpy_g, self._open, self._dwell),        # release
+                (drop + [0, 0, self._transit], rpy_g, self._open, 0),               # retreat
             ]
 
         # Insert via-points so every IK hop stays short: the DLS IK in FK.py is built for
         # small deltas and can stall (silently returning ~the warm start) on long
         # cross-table jumps — which turns a whole leg of the plan into a no-op.
-        expanded: list[tuple[np.ndarray, float, int]] = []
+        expanded: list[tuple[np.ndarray, np.ndarray, float, int]] = []
         prev_xyz = np.asarray(p0[:3], dtype=np.float32) - [0.0, 0.0, self._tcp]
-        for xyz, grip, dwell in wps:
+        for xyz, wrpy, grip, dwell in wps:
             xyz = np.asarray(xyz, dtype=np.float32)
             n_via = int(np.linalg.norm((xyz - prev_xyz)[:2]) // 0.15)
             for v in range(1, n_via + 1):
                 mid = prev_xyz + (xyz - prev_xyz) * v / (n_via + 1)
                 mid[2] = max(prev_xyz[2], xyz[2])
-                expanded.append((mid, grip, 0))
-            expanded.append((xyz, grip, dwell))
+                expanded.append((mid, wrpy, grip, 0))
+            expanded.append((xyz, wrpy, grip, dwell))
             prev_xyz = xyz
 
         def _solve(target6, q_init, q_home):
@@ -180,9 +230,9 @@ class Policy(BasePolicy):
 
         rows: list[np.ndarray] = []
         q_prev = np.asarray(q0, dtype=np.float32)
-        for wi, (xyz, grip, dwell) in enumerate(expanded):
+        for wi, (xyz, wrpy, grip, dwell) in enumerate(expanded):
             xyz = np.asarray(xyz, dtype=np.float32) + [0.0, 0.0, self._tcp]  # fingertip -> flange
-            target6 = np.concatenate([xyz, rpy])
+            target6 = np.concatenate([xyz, np.asarray(wrpy, dtype=np.float32)])
             q_t, err = _solve(target6, q_prev, np.asarray(q0, dtype=np.float32))
             if err > 0.02:
                 logging.warning(
