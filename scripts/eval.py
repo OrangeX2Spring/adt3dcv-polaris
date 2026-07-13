@@ -5,6 +5,7 @@ import mediapy
 import json
 import tqdm
 import gymnasium as gym
+import numpy as np
 import torch
 import argparse
 import pandas as pd
@@ -82,6 +83,48 @@ def main(eval_args: EvalArgs):
         }
 
     step_records: list[dict] = []
+
+    # ---- trajectory recorder (--record-traj): DROID-style staging ----
+    # Samples the sim at ~3.75 fps (every 4th control step, matching V-JEPA2-AC's
+    # ~0.27 s/action training granularity): raw external-cam frame + 8-dim joint state.
+    # Packed into the DROID episode format offline by experiments/expert_data/pack_droid.py.
+    REC_EVERY = 4
+    rec_dir = Path(eval_args.record_traj) if eval_args.record_traj else None
+    if rec_dir:
+        rec_dir.mkdir(parents=True, exist_ok=True)
+    rec_frames: list = []
+    rec_joints: list = []
+    rec_steps: list = []
+
+    def _rec_sample(obs_, step_idx: int):
+        frame = np.asarray(obs_["splat"]["external_cam"])
+        joints = obs_["policy"]["arm_joint_pos"].detach().cpu().numpy().reshape(-1)[:7]
+        grip = obs_["policy"]["gripper_pos"].detach().cpu().numpy().reshape(-1)[:1]
+        rec_frames.append(frame.copy())
+        rec_joints.append(np.concatenate([joints, grip]).astype(np.float32))
+        rec_steps.append(step_idx)
+
+    def _rec_flush(ep: int, ic_idx: int, rubric: dict):
+        success = bool(rubric["success"])
+        if not success and not eval_args.record_keep_failures:
+            rec_frames.clear(); rec_joints.clear(); rec_steps.clear()
+            return
+        tag = "success" if success else "fail"
+        ep_dir = rec_dir / f"ep_ic{ic_idx:03d}_e{ep:04d}_{tag}"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        mediapy.write_video(ep_dir / "video.mp4", rec_frames, fps=15.0 / REC_EVERY)
+        np.save(ep_dir / "joints.npy", np.stack(rec_joints))
+        (ep_dir / "meta.json").write_text(json.dumps({
+            "ic_index": ic_idx,
+            "episode": ep,
+            "success": success,
+            "progress": float(rubric["progress"]),
+            "control_hz": 15,
+            "record_every": REC_EVERY,
+            "frame_control_steps": rec_steps,
+        }))
+        print(f"[record] staged {ep_dir.name}  ({len(rec_frames)} frames)")
+        rec_frames.clear(); rec_joints.clear(); rec_steps.clear()
     # Resume CSV logging
     run_folder = Path(eval_args.run_folder)
     run_folder.mkdir(parents=True, exist_ok=True)
@@ -113,6 +156,8 @@ def main(eval_args: EvalArgs):
         object_positions=_reset_positions(episode)
     )
     policy_client.reset()
+    if rec_dir:
+        _rec_sample(obs, 0)
     print(f" >>> Starting eval job from episode {episode + 1} of {rollouts} <<< ")
     while True:
         if eval_args.send_subtask_state:
@@ -123,9 +168,15 @@ def main(eval_args: EvalArgs):
             action, viz = policy_client.infer(obs, language_instruction)
         if viz is not None:
             video.append(viz)
+        _rec_now = rec_dir is not None and (bar.n + 1) % REC_EVERY == 0
         obs, rew, term, trunc, info = env.step(
-            torch.tensor(action).reshape(1, -1), expensive=policy_client.rerender
+            torch.tensor(action).reshape(1, -1),
+            # force a fresh (expensive) splat render on recorded steps: between chunk
+            # boundaries the cheap path may serve stale frames
+            expensive=policy_client.rerender or _rec_now,
         )
+        if _rec_now:
+            _rec_sample(obs, bar.n + 1)
         if eval_args.step_log:
             step_records.append(
                 {
@@ -154,6 +205,11 @@ def main(eval_args: EvalArgs):
                 )
                 step_records = []
 
+            if rec_dir:
+                _ic_idx = eval_args.fix_ic if eval_args.fix_ic is not None \
+                    else episode % len(initial_conditions)
+                _rec_flush(episode, _ic_idx, info["rubric"])
+
             # Log episode results to CSV
             episode_data = {
                 "episode": episode,
@@ -177,6 +233,8 @@ def main(eval_args: EvalArgs):
             obs, info = env.reset(
                 object_positions=_reset_positions(episode)
             )
+            if rec_dir:
+                _rec_sample(obs, 0)
 
             episode += 1
             video = []

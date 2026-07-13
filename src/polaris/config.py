@@ -60,6 +60,9 @@ class EvalArgs:
     step_log: bool = False  # dump per-step progress + checker _ever flags to episode_<k>_steps.jsonl
     send_subtask_state: bool = False  # send IC index + rubric done-mask to the policy server
     # (for the subtask verifier's oracle goal switching; requires the DroidJointPos client)
+    record_traj: str | None = None  # staging dir for trajectory recording (frames@~3.75fps + joints);
+    # pack into DROID format afterwards with experiments/expert_data/pack_droid.py
+    record_keep_failures: bool = False  # also keep staged episodes that failed the rubric
 
 
 @dataclass
