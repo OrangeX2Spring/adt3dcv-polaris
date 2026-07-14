@@ -43,11 +43,12 @@ cd /workspace/polaris
 bash experiments/expert_data/collect_expert.sh 0 99
 ```
 
-One `Ctrl+C` stops the loop and its active eval process. Rerunning is safe: ICs with an existing
-staged success are skipped, while each invocation uses a new run directory. Useful overrides:
+Each IC gets up to 10 outer attempts. One `Ctrl+C` stops the loop and its active eval process.
+Rerunning is safe: ICs with an existing staged success are skipped, while each invocation uses a
+new run directory. Useful overrides:
 
 ```bash
-POLARIS_MAX_ATTEMPTS=8 bash experiments/expert_data/collect_expert.sh 0 99
+POLARIS_MAX_ATTEMPTS=15 bash experiments/expert_data/collect_expert.sh 0 99
 POLARIS_KEEP_FAILURES=1 bash experiments/expert_data/collect_expert.sh 0 0
 ```
 

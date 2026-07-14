@@ -5,7 +5,7 @@ set -uo pipefail
 
 FIRST=${1:-0}
 LAST=${2:-99}
-MAX_ATTEMPTS=${POLARIS_MAX_ATTEMPTS:-5}
+MAX_ATTEMPTS=${POLARIS_MAX_ATTEMPTS:-10}
 STAGING=${POLARIS_STAGING_DIR:-/workspace/polaris/runs/expert_staging}
 RUN_ROOT=${POLARIS_RUN_ROOT:-/workspace/polaris/runs/expert_runs}
 COLLECTION_ID=${POLARIS_COLLECTION_ID:-$(date +%Y%m%d_%H%M%S)}
