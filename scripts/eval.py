@@ -110,7 +110,12 @@ def main(eval_args: EvalArgs):
             rec_frames.clear(); rec_joints.clear(); rec_steps.clear()
             return
         tag = "success" if success else "fail"
-        ep_dir = rec_dir / f"ep_ic{ic_idx:03d}_e{ep:04d}_{tag}"
+        stem = f"ep_ic{ic_idx:03d}_e{ep:04d}"
+        ep_dir = rec_dir / f"{stem}_{tag}"
+        repeat = 1
+        while ep_dir.exists():
+            ep_dir = rec_dir / f"{stem}_r{repeat:02d}_{tag}"
+            repeat += 1
         ep_dir.mkdir(parents=True, exist_ok=True)
         mediapy.write_video(ep_dir / "video.mp4", rec_frames, fps=15.0 / REC_EVERY)
         np.save(ep_dir / "joints.npy", np.stack(rec_joints))

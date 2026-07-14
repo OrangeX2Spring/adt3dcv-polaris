@@ -1,31 +1,30 @@
+"""Adaptive scripted expert for DROID-FoodBussing data collection.
+
+The expert executes one pickup/drop leg at a time and uses the rubric state sent by
+``scripts/eval.py --send-subtask-state`` to decide what to do next. Failed legs are retried
+inside the same episode with deterministic grasp-orientation and position variants; completed
+foods are never touched again.
+
+Deploy by copying this file to ``policy.py`` and starting ``serve_policy.py`` with
+``POLARIS_IC_FILE`` pointing to FoodBussing's ``initial_conditions.json``.
+
+Important tuning variables (meters / radians / control steps):
+  EXPERT_TCP_OFFSET=0.105
+  EXPERT_GRASP_OFFSET=0.02
+  EXPERT_GRASP_OFFSET_GRAPES=<shared offset>
+  EXPERT_HOVER=0.12
+  EXPERT_TRANSIT=0.20
+  EXPERT_DROP=0.09
+  EXPERT_DWELL=10
+  EXPERT_MAX_DQ=0.05
+  EXPERT_JITTER=0.005
+  EXPERT_DROP_SPREAD=0.02
+  EXPERT_BOWL_CLEARANCE=0.13
+  EXPERT_GRASP_SHIFT_MAX=0.008
+  EXPERT_YAW_ALIGN=1
+  EXPERT_GRIP_INVERT=0
 """
-Scripted expert for DROID-FoodBussing data collection (BEHAVIOR-1K-style classical planner).
 
-Plan: for each food (ice cream, then grapes): hover above -> descend -> close gripper ->
-lift -> move above bowl -> lower -> open -> retreat. Waypoints in EE space with the arm's
-INITIAL orientation kept throughout (no orientation-convention risk); EE->joints via the
-self-tested PandaFK.ik (warm-started); joint-space interpolation under a per-step cap.
-
-It is a drop-in policy.py variant:
-  - NEEDS_MODEL = False  -> serve_policy skips pi0.5 weights (same mechanism as the CEM run)
-  - reads the SAME initial_conditions.json the eval uses (env var POLARIS_IC_FILE)
-  - gets the IC index per episode from "subtask/ic_index"  -> run eval with
-    --send-subtask-state --fix-ic <k>
-  - re-plans on "_episode_reset" (sent by the client at every episode start), adding a small
-    fresh jitter each attempt so retries after a failed grasp are not identical
-
-Tuning via env vars (meters / radians / steps):
-  EXPERT_TCP_OFFSET (0.105)   flange-to-fingertip distance (FK ends at panda_link8!)
-  EXPERT_GRASP_OFFSET (0.02)  fingertip height above object-center z at the grasp waypoint
-  EXPERT_HOVER (0.12)  EXPERT_TRANSIT (0.20)  EXPERT_DROP (0.12)   relative heights
-  EXPERT_DWELL (10)    steps to hold still while the gripper closes/opens
-  EXPERT_MAX_DQ (0.05) max joint delta per control step (speed cap)
-  EXPERT_JITTER (0.005) per-attempt xyz jitter on grasp waypoints
-  EXPERT_GRIP_INVERT (0) set 1 if gripper convention is reversed (default: 1.0 = closed)
-
-Deploy: cp policy_expert.py policy.py, restart serve_policy (same command as always;
-POLARIS_IC_FILE must point at the task's initial_conditions.json).
-"""
 from collections.abc import Sequence
 import json
 import logging
@@ -35,18 +34,25 @@ from typing import Any, TypeAlias
 
 import numpy as np
 from openpi_client import base_policy as _base_policy
+from scipy.spatial.transform import Rotation
 from typing_extensions import override
 
 from vjepa2.FK import PandaFK
 
+
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
-CHUNK = 16          # actions returned per request (matches pi0.5's action horizon)
-ADVANCE = 8         # actions the client consumes before requesting again (open_loop_horizon)
+CHUNK = 16
+ADVANCE = 8
+GRASP_VARIANTS = 5
+FOOD_SPECS = (
+    ("ice_cream", 4, -1.0),
+    ("grapes", 5, 1.0),
+)
 
 
 class Policy(BasePolicy):
-    NEEDS_MODEL = False  # policy_config skips loading pi0.5 weights
+    NEEDS_MODEL = False
 
     def __init__(
         self,
@@ -68,219 +74,378 @@ class Policy(BasePolicy):
                 "Scripted expert needs POLARIS_IC_FILE=<path to initial_conditions.json> "
                 f"(got: {ic_file!r})"
             )
+
         data = json.loads(pathlib.Path(ic_file).read_text())
         self._poses: list[dict] = data["poses"]
         self._robot = PandaFK(device="cpu")
 
-        # PandaFK's chain ends at panda_link8 (the wrist flange); the fingertips sit
-        # ~10.5 cm further along the tool axis. Waypoints are specified for the
-        # FINGERTIPS; this offset lifts the flange target accordingly (world z,
-        # valid for the near-vertical tool orientation of the DROID home pose).
         self._tcp = float(os.environ.get("EXPERT_TCP_OFFSET", 0.105))
         self._grasp_off = float(os.environ.get("EXPERT_GRASP_OFFSET", 0.02))
-        # grapes lie tilted with a lower center (z~0.036 vs ice cream ~0.051) — allow a
-        # separate grasp height; defaults to the shared offset if unset
         self._grasp_off_grapes = float(
             os.environ.get("EXPERT_GRASP_OFFSET_GRAPES", self._grasp_off)
         )
         self._hover = float(os.environ.get("EXPERT_HOVER", 0.12))
         self._transit = float(os.environ.get("EXPERT_TRANSIT", 0.20))
-        self._drop = float(os.environ.get("EXPERT_DROP", 0.12))
+        self._drop = float(os.environ.get("EXPERT_DROP", 0.09))
         self._dwell = int(os.environ.get("EXPERT_DWELL", 10))
         self._max_dq = float(os.environ.get("EXPERT_MAX_DQ", 0.05))
         self._jitter = float(os.environ.get("EXPERT_JITTER", 0.005))
+        self._drop_spread = float(os.environ.get("EXPERT_DROP_SPREAD", 0.02))
+        self._bowl_clearance = float(os.environ.get("EXPERT_BOWL_CLEARANCE", 0.13))
+        self._grasp_shift_max = float(os.environ.get("EXPERT_GRASP_SHIFT_MAX", 0.008))
+        self._via_distance = float(os.environ.get("EXPERT_VIA_DISTANCE", 0.15))
+        self._yaw_align = os.environ.get("EXPERT_YAW_ALIGN", "1") == "1"
         invert = os.environ.get("EXPERT_GRIP_INVERT", "0") == "1"
         self._closed, self._open = (0.0, 1.0) if invert else (1.0, 0.0)
 
-        self._plan: np.ndarray | None = None
-        self._ptr = 0
-        self._attempt = 0
-        logging.info(
-            "Scripted expert ready: %d ICs from %s | grasp_off=%.3f dwell=%d max_dq=%.3f "
-            "jitter=%.3f closed=%.1f",
-            len(self._poses), ic_file, self._grasp_off, self._dwell, self._max_dq,
-            self._jitter, self._closed,
-        )
+        if self._max_dq <= 0 or self._via_distance <= 0:
+            raise ValueError("EXPERT_MAX_DQ and EXPERT_VIA_DISTANCE must be positive")
 
-    # ---------------- planning ----------------
+        self._plan: np.ndarray | None = None
+        self._motion_steps = 0
+        self._ptr = 0
+        self._episode_attempt = 0
+        self._episode_ic: int | None = None
+        self._q_home: np.ndarray | None = None
+        self._active_food: str | None = None
+        self._food_retries: dict[str, int] = {}
+
+        logging.info(
+            "Adaptive expert ready: %d ICs from %s | grasp=%.3f grapes=%.3f "
+            "drop=%.3f dwell=%d max_dq=%.3f jitter=%.3f shift_max=%.3f",
+            len(self._poses),
+            ic_file,
+            self._grasp_off,
+            self._grasp_off_grapes,
+            self._drop,
+            self._dwell,
+            self._max_dq,
+            self._jitter,
+            self._grasp_shift_max,
+        )
 
     @staticmethod
     def _find(pose_dict: dict, needle: str) -> np.ndarray:
-        for k, v in pose_dict.items():
-            if needle in k:
-                return np.asarray(v, dtype=np.float32)
-        raise KeyError(f"No object matching '{needle}' in IC (keys: {list(pose_dict)})")
+        matches = [np.asarray(value, dtype=np.float32) for key, value in pose_dict.items() if needle in key]
+        if len(matches) != 1:
+            raise KeyError(
+                f"Expected exactly one object matching {needle!r}; found {len(matches)} "
+                f"in keys {list(pose_dict)}"
+            )
+        return matches[0]
 
-    def _build_plan(self, ic_index: int, q0: np.ndarray, grip0: float) -> np.ndarray:
+    @staticmethod
+    def _food_spec(food_name: str) -> tuple[str, int, float]:
+        for spec in FOOD_SPECS:
+            if spec[0] == food_name:
+                return spec
+        raise KeyError(food_name)
+
+    @staticmethod
+    def _object_yaw(object_pose: np.ndarray) -> float:
+        quaternion = np.asarray(object_pose[3:7], dtype=np.float64)
+        norm = float(np.linalg.norm(quaternion))
+        if norm < 1e-8:
+            return 0.0
+        quaternion /= norm
+        rotation = Rotation.from_quat(
+            [quaternion[1], quaternion[2], quaternion[3], quaternion[0]]
+        )
+        axes = rotation.apply(np.eye(3))
+        axis = axes[int(np.argmax(np.linalg.norm(axes[:, :2], axis=1)))]
+        return float(np.arctan2(axis[1], axis[0]))
+
+    def _grasp_orientation(
+        self,
+        home_rpy: np.ndarray,
+        object_pose: np.ndarray,
+        bowl_xyz: np.ndarray,
+        variant_index: int,
+    ) -> tuple[np.ndarray, float, str]:
+        if not self._yaw_align:
+            return np.asarray(home_rpy, dtype=np.float32), 0.0, "fixed"
+
+        home_rotation = Rotation.from_euler("xyz", home_rpy)
+        close_direction = home_rotation.apply([0.0, 1.0, 0.0])
+        home_close_yaw = float(np.arctan2(close_direction[1], close_direction[0]))
+        object_yaw = self._object_yaw(object_pose)
+        object_close_yaw = object_yaw + np.pi / 2
+
+        away = np.asarray(object_pose[:2]) - np.asarray(bowl_xyz[:2])
+        distance = float(np.linalg.norm(away))
+        tangent_yaw = float(np.arctan2(away[1], away[0]) + np.pi / 2)
+        if 1e-6 < distance < self._bowl_clearance:
+            candidates = (
+                (object_close_yaw, "object-perpendicular"),
+                (tangent_yaw, "bowl-tangent"),
+                (object_close_yaw + np.pi / 2, "object-parallel"),
+                (object_close_yaw + np.pi / 4, "object-plus45"),
+                (object_close_yaw - np.pi / 4, "object-minus45"),
+            )
+        else:
+            candidates = (
+                (object_close_yaw, "object-perpendicular"),
+                (object_close_yaw + np.pi / 4, "object-plus45"),
+                (object_close_yaw - np.pi / 4, "object-minus45"),
+                (object_close_yaw + np.pi / 2, "object-parallel"),
+                (object_close_yaw + np.pi / 8, "object-plus22"),
+            )
+
+        desired_yaw, mode = candidates[variant_index % len(candidates)]
+        yaw_delta = float(desired_yaw - home_close_yaw)
+        yaw_delta = float((yaw_delta + np.pi / 2) % np.pi - np.pi / 2)
+        grasp_rotation = Rotation.from_euler("z", yaw_delta) * home_rotation
+        return grasp_rotation.as_euler("xyz").astype(np.float32), yaw_delta, mode
+
+    @staticmethod
+    def _rotation_error(target_rpy: np.ndarray, actual_rpy: np.ndarray) -> float:
+        target = Rotation.from_euler("xyz", target_rpy)
+        actual = Rotation.from_euler("xyz", actual_rpy)
+        return float((target * actual.inv()).magnitude())
+
+    def _solve(
+        self,
+        target_pose: np.ndarray,
+        q_init: np.ndarray,
+        q_home: np.ndarray,
+        yaw_delta: float,
+    ) -> tuple[np.ndarray, float, float]:
+        joint_limits = np.asarray(self._robot._JOINT_LIMITS, dtype=np.float32)
+
+        def wrist_seed(base: np.ndarray) -> np.ndarray:
+            seed = np.asarray(base, dtype=np.float32).copy()
+            seed[6] = np.clip(seed[6] + yaw_delta, joint_limits[6, 0], joint_limits[6, 1])
+            return seed
+
+        seeds = (
+            (np.asarray(q_init, dtype=np.float32), 140),
+            (wrist_seed(q_init), 180),
+            (wrist_seed(q_home), 220),
+            (np.asarray(q_home, dtype=np.float32), 220),
+        )
+        best_q: np.ndarray | None = None
+        best_position_error = np.inf
+        best_rotation_error = np.inf
+        best_score = np.inf
+        seen: list[np.ndarray] = []
+
+        for seed, iterations in seeds:
+            if any(np.allclose(seed, previous, atol=1e-5) for previous in seen):
+                continue
+            seen.append(seed)
+            q = np.asarray(
+                self._robot.ik(target_pose, seed, iters=iterations), dtype=np.float32
+            )
+            actual = np.asarray(
+                self._robot.state(np.concatenate([q, [0.0]]).astype(np.float32))
+            )
+            position_error = float(np.linalg.norm(actual[:3] - target_pose[:3]))
+            rotation_error = self._rotation_error(target_pose[3:6], actual[3:6])
+            score = position_error + 0.02 * rotation_error
+            if score < best_score:
+                best_q = q
+                best_position_error = position_error
+                best_rotation_error = rotation_error
+                best_score = score
+            if position_error < 0.012 and rotation_error < 0.12:
+                break
+
+        if best_q is None:
+            raise RuntimeError("IK produced no candidate")
+        return best_q, best_position_error, best_rotation_error
+
+    def _build_leg(
+        self,
+        ic_index: int,
+        food_name: str,
+        q0: np.ndarray,
+        grip0: float,
+        retry_index: int,
+    ) -> tuple[np.ndarray, int]:
+        if self._q_home is None:
+            raise RuntimeError("Episode home joints are not initialized")
+
         ic = self._poses[ic_index]
-        rng = np.random.default_rng(1000 * ic_index + self._attempt)
-        jit = lambda: rng.uniform(-self._jitter, self._jitter, size=3) * [1, 1, 0.6]
+        _, _, drop_sign = self._food_spec(food_name)
+        food_pose = self._find(ic, food_name)
+        bowl_xyz = self._find(ic, "bowl")[:3]
+        grasp_offset = (
+            self._grasp_off_grapes if food_name == "grapes" else self._grasp_off
+        )
+        variant_index = (self._episode_attempt - 1 + retry_index) % GRASP_VARIANTS
 
-        ice_full = self._find(ic, "ice_cream")
-        grapes_full = self._find(ic, "grapes")
-        ice, grapes = ice_full[:3], grapes_full[:3]
-        bowl = self._find(ic, "bowl")[:3]
+        seed = 100_000 * ic_index + 1_000 * self._episode_attempt + 10 * retry_index
+        seed += 1 if food_name == "ice_cream" else 2
+        rng = np.random.default_rng(seed)
+        jitter = rng.uniform(-self._jitter, self._jitter, size=3) * [1.0, 1.0, 0.6]
 
-        p0 = self._robot.state(np.concatenate([q0, [grip0]]).astype(np.float32))
-        rpy = np.asarray(p0[3:6], dtype=np.float32)  # home EE orientation (transit/default)
-        logging.info(
-            "expert targets: ice=%s grapes=%s bowl=%s | ee0(flange)=%s | ic_keys=%s",
-            np.round(ice, 3).tolist(), np.round(grapes, 3).tolist(),
-            np.round(bowl, 3).tolist(), np.round(np.asarray(p0[:3]), 3).tolist(),
-            list(ic.keys()),
+        current_pose = np.asarray(
+            self._robot.state(np.concatenate([q0, [grip0]]).astype(np.float32))
+        )
+        home_rpy = np.asarray(current_pose[3:6], dtype=np.float32)
+        grasp_rpy, yaw_delta, orientation_mode = self._grasp_orientation(
+            home_rpy, food_pose, bowl_xyz, variant_index
         )
 
-        # ---- grasp-yaw alignment + per-attempt sweep -------------------------------
-        # A fixed-orientation top-down pinch is pose-lottery: whether the fingers
-        # straddle the object's long axis depends on the object's per-IC yaw. We align
-        # the gripper to the long axis (from the IC quaternion, wxyz) and SWEEP an
-        # offset across retry attempts — one of the attempts straddles the axis even
-        # though the finger-frame calibration is unknown.
-        from scipy.spatial.transform import Rotation as _R
+        target = np.asarray(food_pose[:3], dtype=np.float64) + jitter
+        away = target[:2] - bowl_xyz[:2]
+        bowl_distance = float(np.linalg.norm(away))
+        grasp_shift = 0.0
+        if 1e-6 < bowl_distance < self._bowl_clearance:
+            grasp_shift = min(self._bowl_clearance - bowl_distance, self._grasp_shift_max)
+            target[:2] += away / bowl_distance * grasp_shift
 
-        yaw_align = os.environ.get("EXPERT_YAW_ALIGN", "1") == "1"
-        SWEEP = [0.0, np.pi / 4, -np.pi / 4, np.pi / 2, np.pi / 8]
-        sweep = SWEEP[(self._attempt - 1) % len(SWEEP)]
-        logging.info(
-            "expert grasp yaw: align=%s sweep_offset=%.0f deg (attempt %d)",
-            yaw_align, np.degrees(sweep), self._attempt,
+        drop = np.asarray(bowl_xyz, dtype=np.float64).copy()
+        drop[0] += drop_sign * self._drop_spread
+        waypoints = (
+            (target + [0.0, 0.0, self._hover], grasp_rpy, self._open, 0),
+            (target + [0.0, 0.0, grasp_offset], grasp_rpy, self._open, 0),
+            (target + [0.0, 0.0, grasp_offset], grasp_rpy, self._closed, self._dwell),
+            (target + [0.0, 0.0, self._transit], grasp_rpy, self._closed, 0),
+            (drop + [0.0, 0.0, self._transit], grasp_rpy, self._closed, 0),
+            (drop + [0.0, 0.0, self._drop], grasp_rpy, self._closed, 0),
+            (drop + [0.0, 0.0, self._drop], grasp_rpy, self._open, self._dwell),
+            (drop + [0.0, 0.0, self._transit], grasp_rpy, self._open, 0),
         )
-        R0 = _R.from_euler("xyz", rpy)
-        close_dir = R0.apply([0.0, 1.0, 0.0])
-        phi0 = float(np.arctan2(close_dir[1], close_dir[0]))
 
-        def grasp_rpy(obj_pose7: np.ndarray) -> np.ndarray:
-            if not yaw_align:
-                return rpy
-            q = obj_pose7[3:7]  # wxyz -> scipy xyzw
-            Ro = _R.from_quat([q[1], q[2], q[3], q[0]])
-            ax, ay = Ro.apply([1.0, 0.0, 0.0]), Ro.apply([0.0, 1.0, 0.0])
-            a = ax if np.hypot(*ax[:2]) >= np.hypot(*ay[:2]) else ay
-            obj_yaw = float(np.arctan2(a[1], a[0]))
-            theta = (obj_yaw + np.pi / 2 + sweep) - phi0
-            theta = ((theta + np.pi / 2) % np.pi) - np.pi / 2  # pinch is 180deg-symmetric
-            Rg = _R.from_euler("z", theta) * R0
-            return Rg.as_euler("xyz").astype(np.float32)
-
-        # (xyz, rpy, gripper, dwell_steps) waypoint list. Drop points are spread
-        # laterally per food (else food #2 lands on food #1 and bounces out).
-        spread = float(os.environ.get("EXPERT_DROP_SPREAD", 0.02))
-        wps: list[tuple[np.ndarray, np.ndarray, float, int]] = []
-        clearance = float(os.environ.get("EXPERT_BOWL_CLEARANCE", 0.13))
-        for food_full, g_off, dx in (
-            (ice_full, self._grasp_off, -spread),
-            (grapes_full, self._grasp_off_grapes, +spread),
-        ):
-            food = food_full[:3]
-            rpy_g = grasp_rpy(food_full)
-            f = food + jit()
-            # If the food sits flush against the bowl, grasp its FAR side: shift the
-            # grasp point away from the bowl so the descending gripper never clips the
-            # bowl wall (which nudges the bowl and ruins the later drop coordinates).
-            away = f[:2] - bowl[:2]
-            d_bowl = float(np.linalg.norm(away))
-            if 1e-6 < d_bowl < clearance:
-                shift = min(clearance - d_bowl, 0.025)
-                f = f.copy()
-                f[:2] += away / d_bowl * shift
-                logging.info(
-                    "expert: food %.3f m from bowl -> grasp shifted %.3f m away from bowl",
-                    d_bowl, shift,
-                )
-            drop = bowl + [dx, 0.0, 0.0]
-            # the aligned orientation is kept for the WHOLE leg (rotating the wrist
-            # mid-carry risks dropping the object)
-            wps += [
-                (f + [0, 0, self._hover], rpy_g, self._open, 0),
-                (f + [0, 0, g_off], rpy_g, self._open, 0),
-                (f + [0, 0, g_off], rpy_g, self._closed, self._dwell),   # close & dwell
-                (f + [0, 0, self._transit], rpy_g, self._closed, 0),                # lift
-                (drop + [0, 0, self._transit], rpy_g, self._closed, 0),             # transit
-                (drop + [0, 0, self._drop], rpy_g, self._closed, 0),                # lower
-                (drop + [0, 0, self._drop], rpy_g, self._open, self._dwell),        # release
-                (drop + [0, 0, self._transit], rpy_g, self._open, 0),               # retreat
-            ]
-
-        # Insert via-points so every IK hop stays short: the DLS IK in FK.py is built for
-        # small deltas and can stall (silently returning ~the warm start) on long
-        # cross-table jumps — which turns a whole leg of the plan into a no-op.
         expanded: list[tuple[np.ndarray, np.ndarray, float, int]] = []
-        prev_xyz = np.asarray(p0[:3], dtype=np.float32) - [0.0, 0.0, self._tcp]
-        for xyz, wrpy, grip, dwell in wps:
-            xyz = np.asarray(xyz, dtype=np.float32)
-            n_via = int(np.linalg.norm((xyz - prev_xyz)[:2]) // 0.15)
-            for v in range(1, n_via + 1):
-                mid = prev_xyz + (xyz - prev_xyz) * v / (n_via + 1)
-                mid[2] = max(prev_xyz[2], xyz[2])
-                expanded.append((mid, wrpy, grip, 0))
-            expanded.append((xyz, wrpy, grip, dwell))
-            prev_xyz = xyz
-
-        def _solve(target6, q_init, q_home):
-            best_q, best_err = None, np.inf
-            for q_seed, iters in ((q_init, 120), (q_home, 200)):
-                q = np.asarray(self._robot.ik(target6, q_seed, iters=iters), dtype=np.float32)
-                fk = np.asarray(self._robot.state(np.concatenate([q, [0.0]]).astype(np.float32)))
-                err = float(np.linalg.norm(fk[:3] - target6[:3]))
-                if err < best_err:
-                    best_q, best_err = q, err
-                if err < 0.015:
-                    break
-            return best_q, best_err
+        previous_xyz = np.asarray(current_pose[:3], dtype=np.float64) - [0.0, 0.0, self._tcp]
+        for xyz, rpy, gripper, dwell in waypoints:
+            xyz = np.asarray(xyz, dtype=np.float64)
+            via_count = int(np.linalg.norm((xyz - previous_xyz)[:2]) // self._via_distance)
+            for via_index in range(1, via_count + 1):
+                ratio = via_index / (via_count + 1)
+                intermediate = previous_xyz + (xyz - previous_xyz) * ratio
+                intermediate[2] = max(previous_xyz[2], xyz[2])
+                expanded.append((intermediate, rpy, gripper, 0))
+            expanded.append((xyz, rpy, gripper, dwell))
+            previous_xyz = xyz
 
         rows: list[np.ndarray] = []
-        q_prev = np.asarray(q0, dtype=np.float32)
-        for wi, (xyz, wrpy, grip, dwell) in enumerate(expanded):
-            xyz = np.asarray(xyz, dtype=np.float32) + [0.0, 0.0, self._tcp]  # fingertip -> flange
-            target6 = np.concatenate([xyz, np.asarray(wrpy, dtype=np.float32)])
-            q_t, err = _solve(target6, q_prev, np.asarray(q0, dtype=np.float32))
-            if err > 0.02:
+        q_previous = np.asarray(q0, dtype=np.float32)
+        for waypoint_index, (xyz, rpy, gripper, dwell) in enumerate(expanded):
+            flange_xyz = np.asarray(xyz, dtype=np.float32) + [0.0, 0.0, self._tcp]
+            target_pose = np.concatenate([flange_xyz, np.asarray(rpy, dtype=np.float32)])
+            q_target, position_error, rotation_error = self._solve(
+                target_pose, q_previous, self._q_home, yaw_delta
+            )
+            if position_error > 0.02 or rotation_error > 0.20:
                 logging.warning(
-                    "expert IK poor convergence at waypoint %d: err=%.3f m target=%s",
-                    wi, err, np.round(target6[:3], 3).tolist(),
+                    "expert IK weak: food=%s waypoint=%d pos_err=%.3f m rot_err=%.1f deg "
+                    "target=%s",
+                    food_name,
+                    waypoint_index,
+                    position_error,
+                    np.degrees(rotation_error),
+                    np.round(target_pose[:3], 3).tolist(),
                 )
-            n = max(int(np.ceil(np.max(np.abs(q_t - q_prev)) / self._max_dq)), 1)
-            for a in np.linspace(1.0 / n, 1.0, n):
-                rows.append(np.concatenate([q_prev + a * (q_t - q_prev), [grip]]))
-            for _ in range(dwell):
-                rows.append(np.concatenate([q_t, [grip]]))
-            q_prev = q_t
+            interpolation_steps = max(
+                int(np.ceil(np.max(np.abs(q_target - q_previous)) / self._max_dq)), 1
+            )
+            for alpha in np.linspace(
+                1.0 / interpolation_steps, 1.0, interpolation_steps
+            ):
+                joints = q_previous + alpha * (q_target - q_previous)
+                rows.append(np.concatenate([joints, [gripper]]))
+            rows.extend(np.concatenate([q_target, [gripper]]) for _ in range(dwell))
+            q_previous = q_target
 
         plan = np.stack(rows).astype(np.float32)
-        # hold the final pose so we never run out of actions within the 450-step horizon
-        tail = np.repeat(plan[-1:], 600, axis=0)
-        plan = np.concatenate([plan, tail], axis=0)
-        logging.info(
-            "expert plan: IC %d attempt %d -> %d motion steps (+hold)",
-            ic_index, self._attempt, len(rows),
-        )
-        return plan
+        motion_steps = len(plan)
+        aligned_steps = ((motion_steps + ADVANCE - 1) // ADVANCE) * ADVANCE
+        hold_steps = aligned_steps - motion_steps + CHUNK
+        plan = np.concatenate([plan, np.repeat(plan[-1:], hold_steps, axis=0)], axis=0)
 
-    # ---------------- serving ----------------
+        logging.info(
+            "expert leg: IC %d episode %d food=%s retry=%d variant=%d mode=%s "
+            "yaw=%.1fdeg shift=%.3f distance=%.3f -> %d motion steps",
+            ic_index,
+            self._episode_attempt,
+            food_name,
+            retry_index + 1,
+            variant_index + 1,
+            orientation_mode,
+            np.degrees(yaw_delta),
+            grasp_shift,
+            bowl_distance,
+            motion_steps,
+        )
+        return plan, motion_steps
+
+    def _next_food(self, done: np.ndarray) -> str | None:
+        missing = [spec for spec in FOOD_SPECS if not done[spec[1]]]
+        if not missing:
+            return None
+        missing.sort(key=lambda spec: (self._food_retries.get(spec[0], 0), spec[1]))
+        return missing[0][0]
+
+    def _reset_episode(self, ic_index: int, q0: np.ndarray) -> None:
+        if not 0 <= ic_index < len(self._poses):
+            raise ValueError(f"IC index {ic_index} out of range 0..{len(self._poses) - 1}")
+        self._episode_attempt += 1
+        self._episode_ic = ic_index
+        self._q_home = np.asarray(q0, dtype=np.float32).copy()
+        self._plan = None
+        self._motion_steps = 0
+        self._ptr = 0
+        self._active_food = None
+        self._food_retries = {spec[0]: 0 for spec in FOOD_SPECS}
+        logging.info("expert episode reset: IC %d episode-attempt %d", ic_index, self._episode_attempt)
 
     @override
     def infer(self, obs: dict, *, noise: Any = None) -> dict:
         episode_reset = bool(obs.pop("_episode_reset", False))
-        ic_index = obs.pop("subtask/ic_index", None)
-        obs.pop("subtask/done", None)
+        ic_index_value = obs.pop("subtask/ic_index", None)
+        done_value = obs.pop("subtask/done", None)
 
-        if episode_reset or self._plan is None:
-            if ic_index is None:
+        q0 = np.asarray(obs["observation/joint_position"], dtype=np.float32).reshape(-1)[:7]
+        grip0 = float(np.asarray(obs["observation/gripper_position"]).reshape(-1)[0])
+
+        if episode_reset:
+            if ic_index_value is None:
                 raise ValueError(
-                    "Scripted expert needs 'subtask/ic_index' — run eval with "
-                    "--send-subtask-state (and --fix-ic <k>)."
+                    "Scripted expert needs subtask/ic_index; run eval with --send-subtask-state"
                 )
-            q0 = np.asarray(obs["observation/joint_position"], dtype=np.float32).reshape(-1)[:7]
-            grip0 = float(np.asarray(obs["observation/gripper_position"]).reshape(-1)[0])
-            self._attempt += 1
-            self._plan = self._build_plan(int(ic_index), q0, grip0)
+            self._reset_episode(int(ic_index_value), q0)
+        elif self._episode_ic is None:
+            raise RuntimeError("Expert received an observation before episode reset")
+        elif ic_index_value is not None and int(ic_index_value) != self._episode_ic:
+            raise ValueError(
+                f"IC changed without episode reset: {self._episode_ic} -> {ic_index_value}"
+            )
+
+        if done_value is None:
+            raise ValueError(
+                "Scripted expert needs subtask/done; run eval with --send-subtask-state"
+            )
+        done = np.asarray(done_value, dtype=bool).reshape(-1)
+        if len(done) < 6:
+            raise ValueError(f"Expected six rubric flags, got {done.tolist()}")
+
+        plan_finished = self._plan is None or self._ptr >= self._motion_steps
+
+        if plan_finished:
+            food_name = self._next_food(done)
+            if food_name is None:
+                hold = np.concatenate([q0, [self._open]]).astype(np.float32)
+                return {"actions": np.repeat(hold[None], CHUNK, axis=0)}
+
+            retry_index = self._food_retries[food_name]
+            self._food_retries[food_name] += 1
+            self._active_food = food_name
+            self._plan, self._motion_steps = self._build_leg(
+                int(self._episode_ic), food_name, q0, grip0, retry_index
+            )
             self._ptr = 0
 
-        chunk = self._plan[self._ptr:self._ptr + CHUNK]
-        if len(chunk) < CHUNK:  # paranoid: hold-tail should make this unreachable
-            chunk = np.concatenate([chunk, np.repeat(self._plan[-1:], CHUNK - len(chunk), axis=0)])
+        if self._plan is None:
+            raise RuntimeError("Expert plan was not initialized")
+        chunk = self._plan[self._ptr : self._ptr + CHUNK]
+        if len(chunk) < CHUNK:
+            chunk = np.concatenate(
+                [chunk, np.repeat(self._plan[-1:], CHUNK - len(chunk), axis=0)]
+            )
         self._ptr += ADVANCE
-        # raw actions, deliberately NOT passed through pi0.5's output transforms
         return {"actions": chunk.astype(np.float32)}
 
     @property

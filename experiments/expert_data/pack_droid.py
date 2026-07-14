@@ -41,10 +41,18 @@ def main():
     packed = []
 
     for ep_dir in sorted(Path(args.staging).glob("ep_*")):
+        required = (ep_dir / "meta.json", ep_dir / "joints.npy", ep_dir / "video.mp4")
+        missing = [path.name for path in required if not path.is_file()]
+        if missing:
+            print(f"!! {ep_dir.name}: missing {', '.join(missing)} -> skipped")
+            continue
         meta = json.loads((ep_dir / "meta.json").read_text())
         if not meta["success"] and not args.include_failures:
             continue
         joints = np.load(ep_dir / "joints.npy")            # (T, 8)
+        if joints.ndim != 2 or joints.shape[1] != 8 or not np.isfinite(joints).all():
+            print(f"!! {ep_dir.name}: invalid joints array {joints.shape} -> skipped")
+            continue
         T = len(joints)
 
         cap = cv2.VideoCapture(str(ep_dir / "video.mp4"))
@@ -66,7 +74,15 @@ def main():
         (dst / "metadata.json").write_text(json.dumps({
             "left_mp4_path": "recordings/MP4/ext.mp4",
             "right_mp4_path": "recordings/MP4/ext.mp4",
-            **{k: meta[k] for k in ("ic_index", "success", "progress")},
+            "source_episode": ep_dir.name,
+            **{
+                key: meta[key]
+                for key in (
+                    "ic_index", "success", "progress", "control_hz", "record_every",
+                    "frame_control_steps",
+                )
+                if key in meta
+            },
         }))
         packed.append(str(dst.resolve()))
         print(f"packed {ep_dir.name}  (T={T}, IC {meta['ic_index']})")
