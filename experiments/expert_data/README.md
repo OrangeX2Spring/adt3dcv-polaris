@@ -22,19 +22,24 @@ uv run scripts/serve_policy.py --port 8000 \
 
 The startup log must say `Adaptive expert ready: 100 ICs`.
 
-## 2. Run three gate ICs
+## 2. Run the repair gate
 
-In another terminal:
+Use fresh test directories so previously staged successes do not get skipped. ICs 0 and 70 are
+known-success controls; ICs 3, 24, and 57 are far-reach failures from the first batch.
 
 ```bash
 cd /workspace/polaris
-bash experiments/expert_data/collect_expert.sh 0 0
-bash experiments/expert_data/collect_expert.sh 30 30
-bash experiments/expert_data/collect_expert.sh 70 70
+for ic in 0 3 24 57 70; do
+  POLARIS_MAX_ATTEMPTS=3 \
+  POLARIS_KEEP_FAILURES=1 \
+  POLARIS_STAGING_DIR=/workspace/polaris/runs/expert_staging_repair_gate \
+  POLARIS_RUN_ROOT=/workspace/polaris/runs/expert_runs_repair_gate \
+  bash experiments/expert_data/collect_expert.sh "$ic" "$ic"
+done
 ```
 
-Do not start the full collection until all three commands report `SUCCESS`. Each episode retries
-unfinished foods internally, and each outer attempt starts from a different grasp variant.
+Do not start another full collection unless both control ICs and at least two of the three hard ICs
+succeed. Each run prints criterion pass rates and failed-stage patterns automatically.
 
 ## 3. Collect all ICs
 

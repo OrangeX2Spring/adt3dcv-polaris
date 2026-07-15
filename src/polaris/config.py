@@ -63,6 +63,7 @@ class EvalArgs:
     record_traj: str | None = None  # staging dir for trajectory recording (frames@~3.75fps + joints);
     # pack into DROID format afterwards with experiments/expert_data/pack_droid.py
     record_keep_failures: bool = False  # also keep staged episodes that failed the rubric
+    stop_on_success: bool = False  # end an episode immediately after the rubric succeeds
 
 
 @dataclass

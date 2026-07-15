@@ -76,6 +76,10 @@ class DroidJointPosClient(InferenceClient):
                 # For the subtask verifier (policy_subtask.py): oracle goal switching.
                 request_data["subtask/ic_index"] = int(subtask_state["ic_index"])
                 request_data["subtask/done"] = [bool(b) for b in subtask_state["done"]]
+                if "object_poses" in subtask_state:
+                    request_data["subtask/object_poses"] = subtask_state["object_poses"]
+                if "ee_pose" in subtask_state:
+                    request_data["subtask/ee_pose"] = subtask_state["ee_pose"]
             server_response = self.client.infer(request_data)
             self.pred_action_chunk = server_response["actions"]
             both = np.concatenate([exterior_image, wrist_image], axis=1)

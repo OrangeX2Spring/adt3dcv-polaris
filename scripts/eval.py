@@ -75,11 +75,25 @@ def main(eval_args: EvalArgs):
     ]
 
     def _subtask_state(ep: int, latest_info) -> dict:
-        """IC index + rubric done-mask for the subtask verifier's oracle goal switching."""
+        """Rubric state and live oracle poses for scripted simulation policies."""
         metrics = (latest_info or {}).get("rubric", {}).get("metrics", {})
+        object_poses = {}
+        for object_name in ("ice_cream_", "grapes", "bowl"):
+            state = env.scene[object_name].data.root_state_w[0, :7]
+            object_poses[object_name] = state.detach().cpu().numpy().tolist()
+        ee_position = (
+            env.scene["ee_frame"].data.target_pos_w[0]
+            .detach().cpu().numpy().reshape(-1, 3)[0]
+        )
+        ee_quaternion = (
+            env.scene["ee_frame"].data.target_quat_w[0]
+            .detach().cpu().numpy().reshape(-1, 4)[0]
+        )
         return {
             "ic_index": eval_args.fix_ic if eval_args.fix_ic is not None else ep % len(initial_conditions),
             "done": [bool(metrics.get(f"{k}_ever", False)) for k in _STAGE_KEYS],
+            "object_poses": object_poses,
+            "ee_pose": np.concatenate([ee_position, ee_quaternion]).tolist(),
         }
 
     step_records: list[dict] = []
@@ -197,7 +211,16 @@ def main(eval_args: EvalArgs):
             )
 
         bar.update(1)
-        if term[0] or trunc[0] or bar.n >= horizon:
+        if (
+            term[0]
+            or trunc[0]
+            or bar.n >= horizon
+            or (
+                eval_args.stop_on_success
+                and info["rubric"]["success"]
+                and (rec_dir is None or _rec_now)
+            )
+        ):
             policy_client.reset()
 
             # Save video and metadata

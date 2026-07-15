@@ -66,7 +66,7 @@ run_eval() {
   local ic=$1
   local folder=$2
   set -- uv run scripts/eval.py --environment DROID-FoodBussing --policy.port 8000 \
-    --rollouts 1 --fix-ic "$ic" --send-subtask-state --step-log \
+    --rollouts 1 --fix-ic "$ic" --send-subtask-state --step-log --stop-on-success \
     --record-traj "$STAGING"
   if [[ $KEEP_FAILURES == 1 ]]; then
     set -- "$@" --record-keep-failures
@@ -147,3 +147,4 @@ if [[ -s $FAILED_LIST ]]; then
 else
   echo "[collect] failed ICs: none"
 fi
+python3 experiments/expert_data/summarize_collection.py "$RUNS" || true

@@ -11,7 +11,7 @@ Deploy by copying this file to ``policy.py`` and starting ``serve_policy.py`` wi
 Important tuning variables (meters / radians / control steps):
   EXPERT_TCP_OFFSET=0.105
   EXPERT_GRASP_OFFSET=0.02
-  EXPERT_GRASP_OFFSET_GRAPES=<shared offset>
+  EXPERT_GRASP_OFFSET_GRAPES=0.005
   EXPERT_HOVER=0.12
   EXPERT_TRANSIT=0.20
   EXPERT_DROP=0.09
@@ -21,6 +21,7 @@ Important tuning variables (meters / radians / control steps):
   EXPERT_DROP_SPREAD=0.02
   EXPERT_BOWL_CLEARANCE=0.13
   EXPERT_GRASP_SHIFT_MAX=0.008
+  EXPERT_IK_ROT_WEIGHT=0.20
   EXPERT_YAW_ALIGN=1
   EXPERT_GRIP_INVERT=0
 """
@@ -44,11 +45,13 @@ BasePolicy: TypeAlias = _base_policy.BasePolicy
 
 CHUNK = 16
 ADVANCE = 8
-GRASP_VARIANTS = 5
+GRASP_VARIANTS = 10
+GRASP_HEIGHT_DELTAS = (0.0, -0.006, 0.006, -0.012, 0.012, -0.003, 0.009, -0.009, 0.015, 0.003)
 FOOD_SPECS = (
-    ("ice_cream", 4, -1.0),
     ("grapes", 5, 1.0),
+    ("ice_cream", 4, -1.0),
 )
+FOOD_RETRY_WEIGHTS = {"grapes": 2.0, "ice_cream": 1.0}
 
 
 class Policy(BasePolicy):
@@ -82,7 +85,7 @@ class Policy(BasePolicy):
         self._tcp = float(os.environ.get("EXPERT_TCP_OFFSET", 0.105))
         self._grasp_off = float(os.environ.get("EXPERT_GRASP_OFFSET", 0.02))
         self._grasp_off_grapes = float(
-            os.environ.get("EXPERT_GRASP_OFFSET_GRAPES", self._grasp_off)
+            os.environ.get("EXPERT_GRASP_OFFSET_GRAPES", 0.005)
         )
         self._hover = float(os.environ.get("EXPERT_HOVER", 0.12))
         self._transit = float(os.environ.get("EXPERT_TRANSIT", 0.20))
@@ -94,12 +97,16 @@ class Policy(BasePolicy):
         self._bowl_clearance = float(os.environ.get("EXPERT_BOWL_CLEARANCE", 0.13))
         self._grasp_shift_max = float(os.environ.get("EXPERT_GRASP_SHIFT_MAX", 0.008))
         self._via_distance = float(os.environ.get("EXPERT_VIA_DISTANCE", 0.15))
+        self._ik_rot_weight = float(os.environ.get("EXPERT_IK_ROT_WEIGHT", 0.20))
         self._yaw_align = os.environ.get("EXPERT_YAW_ALIGN", "1") == "1"
         invert = os.environ.get("EXPERT_GRIP_INVERT", "0") == "1"
         self._closed, self._open = (0.0, 1.0) if invert else (1.0, 0.0)
 
-        if self._max_dq <= 0 or self._via_distance <= 0:
-            raise ValueError("EXPERT_MAX_DQ and EXPERT_VIA_DISTANCE must be positive")
+        if self._max_dq <= 0 or self._via_distance <= 0 or self._ik_rot_weight < 0:
+            raise ValueError(
+                "EXPERT_MAX_DQ and EXPERT_VIA_DISTANCE must be positive; "
+                "EXPERT_IK_ROT_WEIGHT must be non-negative"
+            )
 
         self._plan: np.ndarray | None = None
         self._motion_steps = 0
@@ -112,7 +119,7 @@ class Policy(BasePolicy):
 
         logging.info(
             "Adaptive expert ready: %d ICs from %s | grasp=%.3f grapes=%.3f "
-            "drop=%.3f dwell=%d max_dq=%.3f jitter=%.3f shift_max=%.3f",
+            "drop=%.3f dwell=%d max_dq=%.3f jitter=%.3f shift_max=%.3f ik_rot=%.2f",
             len(self._poses),
             ic_file,
             self._grasp_off,
@@ -122,6 +129,7 @@ class Policy(BasePolicy):
             self._max_dq,
             self._jitter,
             self._grasp_shift_max,
+            self._ik_rot_weight,
         )
 
     @staticmethod
@@ -217,11 +225,26 @@ class Policy(BasePolicy):
             seed[6] = np.clip(seed[6] + yaw_delta, joint_limits[6, 0], joint_limits[6, 1])
             return seed
 
+        def reach_seed(base: np.ndarray) -> np.ndarray:
+            seed = np.asarray(base, dtype=np.float32).copy()
+            seed[0] = np.clip(
+                np.arctan2(target_pose[1], target_pose[0]),
+                joint_limits[0, 0],
+                joint_limits[0, 1],
+            )
+            if np.hypot(target_pose[0], target_pose[1]) > 0.50:
+                seed[1] = -0.35
+                seed[3] = -1.35
+                seed[5] = 1.20
+            return seed
+
+        extended = reach_seed(q_home)
         seeds = (
-            (np.asarray(q_init, dtype=np.float32), 140),
-            (wrist_seed(q_init), 180),
-            (wrist_seed(q_home), 220),
-            (np.asarray(q_home, dtype=np.float32), 220),
+            (np.asarray(q_init, dtype=np.float32), 140, self._ik_rot_weight),
+            (wrist_seed(q_init), 180, self._ik_rot_weight),
+            (np.asarray(q_home, dtype=np.float32), 220, self._ik_rot_weight),
+            (extended, 260, min(self._ik_rot_weight, 0.08)),
+            (wrist_seed(extended), 260, min(self._ik_rot_weight, 0.08)),
         )
         best_q: np.ndarray | None = None
         best_position_error = np.inf
@@ -229,25 +252,31 @@ class Policy(BasePolicy):
         best_score = np.inf
         seen: list[np.ndarray] = []
 
-        for seed, iterations in seeds:
+        for seed, iterations, rotation_weight in seeds:
             if any(np.allclose(seed, previous, atol=1e-5) for previous in seen):
                 continue
             seen.append(seed)
             q = np.asarray(
-                self._robot.ik(target_pose, seed, iters=iterations), dtype=np.float32
+                self._robot.ik(
+                    target_pose,
+                    seed,
+                    iters=iterations,
+                    rot_weight=rotation_weight,
+                ),
+                dtype=np.float32,
             )
             actual = np.asarray(
                 self._robot.state(np.concatenate([q, [0.0]]).astype(np.float32))
             )
             position_error = float(np.linalg.norm(actual[:3] - target_pose[:3]))
             rotation_error = self._rotation_error(target_pose[3:6], actual[3:6])
-            score = position_error + 0.02 * rotation_error
+            score = position_error + 0.005 * rotation_error
             if score < best_score:
                 best_q = q
                 best_position_error = position_error
                 best_rotation_error = rotation_error
                 best_score = score
-            if position_error < 0.012 and rotation_error < 0.12:
+            if position_error < 0.010 and rotation_error < 0.35:
                 break
 
         if best_q is None:
@@ -261,18 +290,32 @@ class Policy(BasePolicy):
         q0: np.ndarray,
         grip0: float,
         retry_index: int,
+        live_poses: dict[str, Any] | None,
+        sim_ee_pose: np.ndarray | None,
     ) -> tuple[np.ndarray, int]:
         if self._q_home is None:
             raise RuntimeError("Episode home joints are not initialized")
 
         ic = self._poses[ic_index]
         _, _, drop_sign = self._food_spec(food_name)
-        food_pose = self._find(ic, food_name)
-        bowl_xyz = self._find(ic, "bowl")[:3]
-        grasp_offset = (
+        initial_food_pose = self._find(ic, food_name)
+        initial_bowl_pose = self._find(ic, "bowl")
+        if live_poses:
+            try:
+                food_pose = self._find(live_poses, food_name)
+                bowl_pose = self._find(live_poses, "bowl")
+            except KeyError:
+                food_pose = initial_food_pose
+                bowl_pose = initial_bowl_pose
+        else:
+            food_pose = initial_food_pose
+            bowl_pose = initial_bowl_pose
+        bowl_xyz = bowl_pose[:3]
+        base_grasp_offset = (
             self._grasp_off_grapes if food_name == "grapes" else self._grasp_off
         )
         variant_index = (self._episode_attempt - 1 + retry_index) % GRASP_VARIANTS
+        grasp_offset = base_grasp_offset + GRASP_HEIGHT_DELTAS[variant_index]
 
         seed = 100_000 * ic_index + 1_000 * self._episode_attempt + 10 * retry_index
         seed += 1 if food_name == "ice_cream" else 2
@@ -282,6 +325,13 @@ class Policy(BasePolicy):
         current_pose = np.asarray(
             self._robot.state(np.concatenate([q0, [grip0]]).astype(np.float32))
         )
+        if sim_ee_pose is not None:
+            logging.info(
+                "expert frame check: sim_ee=%s fk_link8=%s delta=%s",
+                np.round(sim_ee_pose[:3], 3).tolist(),
+                np.round(current_pose[:3], 3).tolist(),
+                np.round(sim_ee_pose[:3] - current_pose[:3], 3).tolist(),
+            )
         home_rpy = np.asarray(current_pose[3:6], dtype=np.float32)
         grasp_rpy, yaw_delta, orientation_mode = self._grasp_orientation(
             home_rpy, food_pose, bowl_xyz, variant_index
@@ -358,7 +408,8 @@ class Policy(BasePolicy):
 
         logging.info(
             "expert leg: IC %d episode %d food=%s retry=%d variant=%d mode=%s "
-            "yaw=%.1fdeg shift=%.3f distance=%.3f -> %d motion steps",
+            "yaw=%.1fdeg grasp_z=%.3f shift=%.3f bowl_distance=%.3f moved=%.3f "
+            "-> %d motion steps",
             ic_index,
             self._episode_attempt,
             food_name,
@@ -366,8 +417,10 @@ class Policy(BasePolicy):
             variant_index + 1,
             orientation_mode,
             np.degrees(yaw_delta),
+            grasp_offset,
             grasp_shift,
             bowl_distance,
+            float(np.linalg.norm(food_pose[:3] - initial_food_pose[:3])),
             motion_steps,
         )
         return plan, motion_steps
@@ -376,7 +429,12 @@ class Policy(BasePolicy):
         missing = [spec for spec in FOOD_SPECS if not done[spec[1]]]
         if not missing:
             return None
-        missing.sort(key=lambda spec: (self._food_retries.get(spec[0], 0), spec[1]))
+        missing.sort(
+            key=lambda spec: (
+                self._food_retries.get(spec[0], 0) / FOOD_RETRY_WEIGHTS[spec[0]],
+                FOOD_SPECS.index(spec),
+            )
+        )
         return missing[0][0]
 
     def _reset_episode(self, ic_index: int, q0: np.ndarray) -> None:
@@ -397,6 +455,8 @@ class Policy(BasePolicy):
         episode_reset = bool(obs.pop("_episode_reset", False))
         ic_index_value = obs.pop("subtask/ic_index", None)
         done_value = obs.pop("subtask/done", None)
+        live_poses = obs.pop("subtask/object_poses", None)
+        sim_ee_value = obs.pop("subtask/ee_pose", None)
 
         q0 = np.asarray(obs["observation/joint_position"], dtype=np.float32).reshape(-1)[:7]
         grip0 = float(np.asarray(obs["observation/gripper_position"]).reshape(-1)[0])
@@ -433,8 +493,19 @@ class Policy(BasePolicy):
             retry_index = self._food_retries[food_name]
             self._food_retries[food_name] += 1
             self._active_food = food_name
+            sim_ee_pose = (
+                None
+                if sim_ee_value is None
+                else np.asarray(sim_ee_value, dtype=np.float32).reshape(-1)
+            )
             self._plan, self._motion_steps = self._build_leg(
-                int(self._episode_ic), food_name, q0, grip0, retry_index
+                int(self._episode_ic),
+                food_name,
+                q0,
+                grip0,
+                retry_index,
+                live_poses,
+                sim_ee_pose,
             )
             self._ptr = 0
 

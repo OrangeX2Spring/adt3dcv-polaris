@@ -180,8 +180,17 @@ class PandaFK:
         [-2.8973, 2.8973], [-0.0175, 3.7525], [-2.8973, 2.8973],
     ], dtype=np.float32)
 
-    def ik(self, target_pose6, q_init7, iters: int = 60, damping: float = 0.05,
-           step: float = 0.5, pos_tol: float = 2e-3, rot_tol: float = 5e-3) -> np.ndarray:
+    def ik(
+        self,
+        target_pose6,
+        q_init7,
+        iters: int = 60,
+        damping: float = 0.05,
+        step: float = 0.5,
+        pos_tol: float = 2e-3,
+        rot_tol: float = 5e-3,
+        rot_weight: float = 1.0,
+    ) -> np.ndarray:
         """
         目标 6D EE 位姿 → 7 关节角（阻尼最小二乘雅可比 IK，从 q_init7 热启动）。
 
@@ -193,6 +202,9 @@ class PandaFK:
         p_tgt = target_pose6[:3]
         R_tgt = Rotation.from_euler(self.euler_seq, target_pose6[3:6], degrees=False).as_matrix()
 
+        if rot_weight < 0:
+            raise ValueError("rot_weight must be non-negative")
+
         q = torch.tensor(np.asarray(q_init7, dtype=np.float32)[:7], device=self.device)
         lim = torch.tensor(self._JOINT_LIMITS, device=self.device)
 
@@ -202,13 +214,22 @@ class PandaFK:
             R_cur = T_cur[:3, :3]
             e_pos = p_tgt - p_cur                                      # (3,)
             e_rot = Rotation.from_matrix(R_tgt @ R_cur.T).as_rotvec()  # (3,) world-frame
-            if np.linalg.norm(e_pos) < pos_tol and np.linalg.norm(e_rot) < rot_tol:
+            if (
+                np.linalg.norm(e_pos) < pos_tol
+                and (rot_weight == 0 or np.linalg.norm(e_rot) < rot_tol)
+            ):
                 break
-            err = torch.tensor(np.concatenate([e_pos, e_rot]), dtype=torch.float32, device=self.device)  # (6,)
+            err = torch.tensor(
+                np.concatenate([e_pos, rot_weight * e_rot]),
+                dtype=torch.float32,
+                device=self.device,
+            )
             J = self._chain.jacobian(q[None])[0]                       # (6,7) [v;w] in base frame
-            JT = J.transpose(0, 1)
+            weighted_J = J.clone()
+            weighted_J[3:] *= rot_weight
+            JT = weighted_J.transpose(0, 1)
             reg = (damping ** 2) * torch.eye(6, device=self.device)
-            dq = JT @ torch.linalg.solve(J @ JT + reg, err)            # (7,)
+            dq = JT @ torch.linalg.solve(weighted_J @ JT + reg, err)   # (7,)
             q = torch.clamp(q + step * dq, lim[:, 0], lim[:, 1])
 
         return q.detach().cpu().numpy()
