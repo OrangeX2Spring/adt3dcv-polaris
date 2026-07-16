@@ -17,6 +17,7 @@ Important tuning variables (meters / radians / control steps):
   EXPERT_DROP=0.09
   EXPERT_DWELL=10
   EXPERT_MAX_DQ=0.05
+  EXPERT_MAX_INTERPOLATION_STEPS=256
   EXPERT_JITTER=0.005
   EXPERT_DROP_SPREAD=0.02
   EXPERT_BOWL_CLEARANCE=0.13
@@ -52,6 +53,10 @@ FOOD_SPECS = (
     ("ice_cream", 4, -1.0),
 )
 FOOD_RETRY_WEIGHTS = {"grapes": 2.0, "ice_cream": 1.0}
+NOMINAL_HOME = np.array(
+    [0.0, -np.pi / 4, 0.0, -3 * np.pi / 4, 0.0, np.pi / 2, np.pi / 4],
+    dtype=np.float32,
+)
 
 
 class Policy(BasePolicy):
@@ -92,6 +97,9 @@ class Policy(BasePolicy):
         self._drop = float(os.environ.get("EXPERT_DROP", 0.09))
         self._dwell = int(os.environ.get("EXPERT_DWELL", 10))
         self._max_dq = float(os.environ.get("EXPERT_MAX_DQ", 0.05))
+        self._max_interpolation_steps = int(
+            os.environ.get("EXPERT_MAX_INTERPOLATION_STEPS", 256)
+        )
         self._jitter = float(os.environ.get("EXPERT_JITTER", 0.005))
         self._drop_spread = float(os.environ.get("EXPERT_DROP_SPREAD", 0.02))
         self._bowl_clearance = float(os.environ.get("EXPERT_BOWL_CLEARANCE", 0.13))
@@ -102,9 +110,15 @@ class Policy(BasePolicy):
         invert = os.environ.get("EXPERT_GRIP_INVERT", "0") == "1"
         self._closed, self._open = (0.0, 1.0) if invert else (1.0, 0.0)
 
-        if self._max_dq <= 0 or self._via_distance <= 0 or self._ik_rot_weight < 0:
+        if (
+            self._max_dq <= 0
+            or self._max_interpolation_steps <= 0
+            or self._via_distance <= 0
+            or self._ik_rot_weight < 0
+        ):
             raise ValueError(
-                "EXPERT_MAX_DQ and EXPERT_VIA_DISTANCE must be positive; "
+                "EXPERT_MAX_DQ, EXPERT_MAX_INTERPOLATION_STEPS, and "
+                "EXPERT_VIA_DISTANCE must be positive; "
                 "EXPERT_IK_ROT_WEIGHT must be non-negative"
             )
 
@@ -211,6 +225,36 @@ class Policy(BasePolicy):
         actual = Rotation.from_euler("xyz", actual_rpy)
         return float((target * actual.inv()).magnitude())
 
+    def _sanitize_observed_joints(self, joints: np.ndarray) -> np.ndarray:
+        q = np.asarray(joints, dtype=np.float32).reshape(-1)
+        if len(q) < 7:
+            raise ValueError(f"Expected seven arm joints, got shape {q.shape}")
+        q = q[:7]
+        joint_limits = np.asarray(self._robot._JOINT_LIMITS, dtype=np.float32)
+        finite = np.isfinite(q)
+        severely_invalid = (
+            not np.all(finite)
+            or np.any(q < joint_limits[:, 0] - 0.25)
+            or np.any(q > joint_limits[:, 1] + 0.25)
+        )
+        if severely_invalid:
+            fallback = self._q_home
+            if fallback is None or not np.all(np.isfinite(fallback)):
+                fallback = NOMINAL_HOME
+            logging.warning(
+                "expert rejected invalid observed joints %s; using safe fallback %s",
+                q.tolist(),
+                np.round(fallback, 3).tolist(),
+            )
+            q = np.asarray(fallback, dtype=np.float32).copy()
+        elif not np.all(
+            (q >= joint_limits[:, 0]) & (q <= joint_limits[:, 1])
+        ):
+            logging.warning(
+                "expert clipped slightly out-of-limit observed joints %s", q.tolist()
+            )
+        return np.clip(q, joint_limits[:, 0], joint_limits[:, 1]).astype(np.float32)
+
     def _solve(
         self,
         target_pose: np.ndarray,
@@ -264,12 +308,21 @@ class Policy(BasePolicy):
                     rot_weight=rotation_weight,
                 ),
                 dtype=np.float32,
-            )
+            ).reshape(-1)
+            if len(q) != 7 or not np.all(np.isfinite(q)):
+                logging.warning("expert IK returned invalid joints: %s", q.tolist())
+                continue
+            q = np.clip(q, joint_limits[:, 0], joint_limits[:, 1])
             actual = np.asarray(
                 self._robot.state(np.concatenate([q, [0.0]]).astype(np.float32))
             )
+            if not np.all(np.isfinite(actual)):
+                logging.warning("expert FK returned invalid pose for joints %s", q.tolist())
+                continue
             position_error = float(np.linalg.norm(actual[:3] - target_pose[:3]))
             rotation_error = self._rotation_error(target_pose[3:6], actual[3:6])
+            if not np.isfinite(position_error) or not np.isfinite(rotation_error):
+                continue
             score = position_error + 0.005 * rotation_error
             if score < best_score:
                 best_q = q
@@ -392,9 +445,17 @@ class Policy(BasePolicy):
             interpolation_steps = max(
                 int(np.ceil(np.max(np.abs(q_target - q_previous)) / self._max_dq)), 1
             )
-            for alpha in np.linspace(
-                1.0 / interpolation_steps, 1.0, interpolation_steps
-            ):
+            if interpolation_steps > self._max_interpolation_steps:
+                logging.warning(
+                    "expert capped interpolation from %d to %d steps; previous=%s target=%s",
+                    interpolation_steps,
+                    self._max_interpolation_steps,
+                    np.round(q_previous, 3).tolist(),
+                    np.round(q_target, 3).tolist(),
+                )
+                interpolation_steps = self._max_interpolation_steps
+            for step_index in range(interpolation_steps):
+                alpha = (step_index + 1) / interpolation_steps
                 joints = q_previous + alpha * (q_target - q_previous)
                 rows.append(np.concatenate([joints, [gripper]]))
             rows.extend(np.concatenate([q_target, [gripper]]) for _ in range(dwell))
@@ -458,7 +519,7 @@ class Policy(BasePolicy):
         live_poses = obs.pop("subtask/object_poses", None)
         sim_ee_value = obs.pop("subtask/ee_pose", None)
 
-        q0 = np.asarray(obs["observation/joint_position"], dtype=np.float32).reshape(-1)[:7]
+        q0 = self._sanitize_observed_joints(obs["observation/joint_position"])
         grip0 = float(np.asarray(obs["observation/gripper_position"]).reshape(-1)[0])
 
         if episode_reset:

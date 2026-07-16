@@ -205,8 +205,14 @@ class PandaFK:
         if rot_weight < 0:
             raise ValueError("rot_weight must be non-negative")
 
-        q = torch.tensor(np.asarray(q_init7, dtype=np.float32)[:7], device=self.device)
         lim = torch.tensor(self._JOINT_LIMITS, device=self.device)
+        q_init = np.asarray(q_init7, dtype=np.float32).reshape(-1)
+        if len(q_init) < 7:
+            raise ValueError(f"Expected seven initial joints, got shape {q_init.shape}")
+        q_init = q_init[:7]
+        q_init = np.nan_to_num(q_init, nan=0.0, posinf=0.0, neginf=0.0)
+        q = torch.tensor(q_init, device=self.device)
+        q = torch.clamp(q, lim[:, 0], lim[:, 1])
 
         for _ in range(iters):
             T_cur = self._chain.forward_kinematics(q[None]).get_matrix()[0].cpu().numpy()  # (4,4)
@@ -230,7 +236,12 @@ class PandaFK:
             JT = weighted_J.transpose(0, 1)
             reg = (damping ** 2) * torch.eye(6, device=self.device)
             dq = JT @ torch.linalg.solve(weighted_J @ JT + reg, err)   # (7,)
-            q = torch.clamp(q + step * dq, lim[:, 0], lim[:, 1])
+            if not torch.isfinite(dq).all():
+                break
+            q_next = q + step * dq
+            if not torch.isfinite(q_next).all():
+                break
+            q = torch.clamp(q_next, lim[:, 0], lim[:, 1])
 
         return q.detach().cpu().numpy()
 
