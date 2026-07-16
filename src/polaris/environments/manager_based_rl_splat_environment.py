@@ -1,7 +1,9 @@
-import torch
-import cv2
+import logging
 from pathlib import Path
+
+import cv2
 import numpy as np
+import torch
 
 from isaaclab.sensors.camera.camera import Camera
 import isaaclab.utils.math as math
@@ -32,6 +34,7 @@ class ManagerBasedRLSplatEnv(ManagerBasedRLEnv):
             cfg.dynamic_setup(usd_file)
 
         super().__init__(cfg=cfg, *args, **kwargs)
+        self._invalid_camera_names: set[str] = set()
         self.setup_splat_world_and_robot_views()
         self.setup_splat_robot()
         self.rubric = rubric
@@ -134,6 +137,38 @@ class ManagerBasedRLSplatEnv(ManagerBasedRLEnv):
                         self.scene[cam].data.output["rgb"][0].detach().cpu().numpy()
                     )
         return rgb
+
+    def _camera_extrinsics(self, name: str) -> dict[str, np.ndarray] | None:
+        pos = self.scene[name].data.pos_w[0].detach().cpu().numpy()
+        quat = self.scene[name].data.quat_w_world[0]
+        quat_norm = torch.linalg.vector_norm(quat)
+        valid = (
+            np.all(np.isfinite(pos))
+            and bool(torch.isfinite(quat).all().item())
+            and bool(torch.isfinite(quat_norm).item())
+            and float(quat_norm.item()) > 1e-6
+        )
+        if not valid:
+            if name not in self._invalid_camera_names:
+                logging.warning(
+                    "Skipping invalid camera pose for %s: pos=%s quat=%s",
+                    name,
+                    pos.tolist(),
+                    quat.detach().cpu().tolist(),
+                )
+                self._invalid_camera_names.add(name)
+            return None
+
+        quat = quat / quat_norm
+        rot = math.matrix_from_quat(quat).detach().cpu().numpy()
+        if not np.all(np.isfinite(rot)):
+            if name not in self._invalid_camera_names:
+                logging.warning("Skipping non-finite camera rotation for %s", name)
+                self._invalid_camera_names.add(name)
+            return None
+
+        self._invalid_camera_names.discard(name)
+        return {"pos": pos, "rot": rot}
 
     def setup_splat_world_and_robot_views(self):
         splats = {}
@@ -247,11 +282,9 @@ class ManagerBasedRLSplatEnv(ManagerBasedRLEnv):
         if transform_static:
             cam_extrinsics_dict = {}
             for name in self.splat_renderer.cameras:
-                pos = self.scene[name].data.pos_w[0].detach().cpu().numpy()
-                quat = self.scene[name].data.quat_w_world[0]
-
-                rot = math.matrix_from_quat(quat).detach().cpu().numpy()
-                cam_extrinsics_dict[name] = {"pos": pos, "rot": rot}
+                extrinsics = self._camera_extrinsics(name)
+                if extrinsics is not None:
+                    cam_extrinsics_dict[name] = extrinsics
 
             if len(self.splat_renderer.pcds) > 0:
                 self.splat_renderer.render(cam_extrinsics_dict)
@@ -261,11 +294,9 @@ class ManagerBasedRLSplatEnv(ManagerBasedRLEnv):
         cam_extrinsics_dict = {}
         for name in self.splat_renderer.cameras:
             if "wrist" in name:
-                pos = self.scene[name].data.pos_w[0].detach().cpu().numpy()
-                quat = self.scene[name].data.quat_w_world[0]
-
-                rot = math.matrix_from_quat(quat).detach().cpu().numpy()
-                cam_extrinsics_dict[name] = {"pos": pos, "rot": rot}
+                extrinsics = self._camera_extrinsics(name)
+                if extrinsics is not None:
+                    cam_extrinsics_dict[name] = extrinsics
 
         # perform splat rendering
         if len(self.splat_renderer.pcds) > 0:

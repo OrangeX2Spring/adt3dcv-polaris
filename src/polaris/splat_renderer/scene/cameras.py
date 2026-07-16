@@ -9,9 +9,11 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import logging
+
+import numpy as np
 import torch
 from torch import nn
-import numpy as np
 from polaris.splat_renderer.utils.graphics_utils import (
     getWorld2View2,
     getProjectionMatrix,
@@ -93,42 +95,85 @@ class Camera(nn.Module):
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
     def set_extrinsics(self, R, T):
-        self.R = R
-        self.T = T
+        prepared = self._prepare_extrinsics(R, T)
+        if prepared is None:
+            return False
+        R, T = prepared
         center = np.zeros(3)
-        self.world_view_transform = (
+        world_view_transform = (
             torch.tensor(getWorld2View2(R, center, T, self.scale))
             .transpose(0, 1)
             .to(self.data_device)
         )
-        # self.world_view_transform = torch.tensor(getWorld2View2(R, T, self.trans, self.scale)).transpose(0, 1).to(self.data_device)
-        self.full_proj_transform = (
-            self.world_view_transform.unsqueeze(0).bmm(
+        try:
+            camera_center = torch.linalg.inv(world_view_transform)[3, :3]
+        except RuntimeError:
+            logging.warning("Rejected singular camera transform for %s", self.image_name)
+            return False
+        full_proj_transform = (
+            world_view_transform.unsqueeze(0).bmm(
                 self.projection_matrix.unsqueeze(0)
             )
         ).squeeze(0)
-        self.camera_center = self.world_view_transform.inverse()[3, :3]
-
-        # print(self.full_proj_transform)
-
-    def set_extrinsics2(self, R, T):
         self.R = R
         self.T = T
-        center = np.zeros(3)
-        # self.world_view_transform = torch.tensor(getWorld2View2(R, center, T, self.scale)).transpose(0, 1).to(self.data_device)
-        self.world_view_transform = (
+        self.world_view_transform = world_view_transform
+        self.full_proj_transform = full_proj_transform
+        self.camera_center = camera_center
+        return True
+
+    def set_extrinsics2(self, R, T):
+        prepared = self._prepare_extrinsics(R, T)
+        if prepared is None:
+            return False
+        R, T = prepared
+        world_view_transform = (
             torch.tensor(getWorld2View2(R, T, self.trans, self.scale))
             .transpose(0, 1)
             .to(self.data_device)
         )
-        self.full_proj_transform = (
-            self.world_view_transform.unsqueeze(0).bmm(
+        try:
+            camera_center = torch.linalg.inv(world_view_transform)[3, :3]
+        except RuntimeError:
+            logging.warning("Rejected singular camera transform for %s", self.image_name)
+            return False
+        full_proj_transform = (
+            world_view_transform.unsqueeze(0).bmm(
                 self.projection_matrix.unsqueeze(0)
             )
         ).squeeze(0)
-        self.camera_center = self.world_view_transform.inverse()[3, :3]
+        self.R = R
+        self.T = T
+        self.world_view_transform = world_view_transform
+        self.full_proj_transform = full_proj_transform
+        self.camera_center = camera_center
+        return True
 
-        # print(self.full_proj_transform)
+    def _prepare_extrinsics(self, R, T):
+        rotation = np.asarray(R, dtype=np.float64)
+        translation = np.asarray(T, dtype=np.float64).reshape(-1)
+        if (
+            rotation.shape != (3, 3)
+            or len(translation) != 3
+            or not np.all(np.isfinite(rotation))
+            or not np.all(np.isfinite(translation))
+        ):
+            logging.warning("Rejected invalid camera extrinsics for %s", self.image_name)
+            return None
+
+        try:
+            left, singular_values, right = np.linalg.svd(rotation)
+        except np.linalg.LinAlgError:
+            logging.warning("Rejected unstable camera rotation for %s", self.image_name)
+            return None
+        if singular_values[-1] < 1e-4:
+            logging.warning("Rejected near-singular camera rotation for %s", self.image_name)
+            return None
+        rotation = left @ right
+        if np.linalg.det(rotation) < 0:
+            left[:, -1] *= -1
+            rotation = left @ right
+        return rotation.astype(np.float32), translation.astype(np.float32)
 
 
 class MiniCam:
