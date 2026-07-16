@@ -12,6 +12,8 @@ Important tuning variables (meters / radians / control steps):
   EXPERT_TCP_OFFSET=0.105
   EXPERT_GRASP_OFFSET=0.02
   EXPERT_GRASP_OFFSET_GRAPES=0.005
+  EXPERT_FAR_REACH_THRESHOLD=0.54
+  EXPERT_FAR_ICE_INWARD_SHIFT=0.025
   EXPERT_HOVER=0.12
   EXPERT_TRANSIT=0.20
   EXPERT_DROP=0.09
@@ -98,6 +100,12 @@ class Policy(BasePolicy):
         self._grasp_off_grapes = float(
             os.environ.get("EXPERT_GRASP_OFFSET_GRAPES", 0.005)
         )
+        self._far_reach_threshold = float(
+            os.environ.get("EXPERT_FAR_REACH_THRESHOLD", 0.54)
+        )
+        self._far_ice_inward_shift = float(
+            os.environ.get("EXPERT_FAR_ICE_INWARD_SHIFT", 0.025)
+        )
         self._hover = float(os.environ.get("EXPERT_HOVER", 0.12))
         self._transit = float(os.environ.get("EXPERT_TRANSIT", 0.20))
         self._drop = float(os.environ.get("EXPERT_DROP", 0.09))
@@ -134,6 +142,8 @@ class Policy(BasePolicy):
         if (
             self._max_dq <= 0
             or self._max_interpolation_steps <= 0
+            or self._far_reach_threshold <= 0
+            or self._far_ice_inward_shift < 0
             or self._via_distance <= 0
             or self._ik_rot_weight < 0
             or self._ik_pos_tol <= 0
@@ -147,6 +157,8 @@ class Policy(BasePolicy):
         ):
             raise ValueError(
                 "EXPERT_MAX_DQ, EXPERT_MAX_INTERPOLATION_STEPS, and "
+                "EXPERT_FAR_REACH_THRESHOLD must be positive; "
+                "EXPERT_FAR_ICE_INWARD_SHIFT must be non-negative; "
                 "EXPERT_VIA_DISTANCE must be positive; EXPERT_IK_POS_TOL and "
                 "EXPERT_IK_ROT_TOL must be positive; object workspace and IK "
                 "error limits, joint margin, and retry limit must be valid; "
@@ -302,6 +314,20 @@ class Policy(BasePolicy):
                 f"aborting this attempt: {pose[:7].tolist()}"
             )
         return pose
+
+    def _is_far_ice(self) -> bool:
+        if self._episode_ic is None:
+            return False
+        ice_pose = self._find(self._poses[self._episode_ic], "ice_cream")
+        return float(np.linalg.norm(ice_pose[:2])) >= self._far_reach_threshold
+
+    def _abort_episode(self, q0: np.ndarray, reason: str) -> dict[str, Any]:
+        logging.warning("%s; requesting a fresh IC attempt", reason)
+        hold = np.concatenate([q0, [self._open]]).astype(np.float32)
+        return {
+            "actions": np.repeat(hold[None], CHUNK, axis=0),
+            "abort_episode": True,
+        }
 
     def _solve(
         self,
@@ -462,6 +488,19 @@ class Policy(BasePolicy):
         )
 
         target = np.asarray(food_pose[:3], dtype=np.float64) + jitter
+        inward_shift = 0.0
+        initial_radius = float(np.linalg.norm(initial_food_pose[:2]))
+        if (
+            food_name == "ice_cream"
+            and initial_radius >= self._far_reach_threshold
+            and initial_radius > 1e-6
+        ):
+            inward_shift = self._far_ice_inward_shift
+            target[:2] -= (
+                np.asarray(initial_food_pose[:2], dtype=np.float64)
+                / initial_radius
+                * inward_shift
+            )
         away = target[:2] - bowl_xyz[:2]
         bowl_distance = float(np.linalg.norm(away))
         grasp_shift = 0.0
@@ -557,7 +596,8 @@ class Policy(BasePolicy):
 
         logging.info(
             "expert leg: IC %d episode %d food=%s retry=%d variant=%d mode=%s "
-            "yaw=%.1fdeg grasp_z=%.3f shift=%.3f bowl_distance=%.3f moved=%.3f "
+            "yaw=%.1fdeg grasp_z=%.3f inward_shift=%.3f shift=%.3f "
+            "bowl_distance=%.3f moved=%.3f "
             "-> %d motion steps",
             ic_index,
             self._episode_attempt,
@@ -567,6 +607,7 @@ class Policy(BasePolicy):
             orientation_mode,
             np.degrees(yaw_delta),
             grasp_offset,
+            inward_shift,
             grasp_shift,
             bowl_distance,
             float(np.linalg.norm(food_pose[:3] - initial_food_pose[:3])),
@@ -585,6 +626,12 @@ class Policy(BasePolicy):
         missing = [spec for spec in FOOD_SPECS if not done[spec[1]]]
         if not missing:
             return None
+        if (
+            self._is_far_ice()
+            and not done[4]
+            and self._food_retries.get("ice_cream", 0) == 0
+        ):
+            return "ice_cream"
         missing.sort(
             key=lambda spec: (
                 self._food_retries.get(spec[0], 0) / FOOD_RETRY_WEIGHTS[spec[0]],
@@ -641,6 +688,15 @@ class Policy(BasePolicy):
         plan_finished = self._plan is None or self._ptr >= self._motion_steps
 
         if plan_finished:
+            if (
+                self._active_food == "ice_cream"
+                and self._is_far_ice()
+                and self._food_retries.get("ice_cream", 0) >= 1
+                and not done[2]
+            ):
+                return self._abort_episode(
+                    q0, "far ice grasp did not lift on its clean first attempt"
+                )
             food_name = self._next_food(done)
             if food_name is None:
                 hold = np.concatenate([q0, [self._open]]).astype(np.float32)
@@ -648,16 +704,10 @@ class Policy(BasePolicy):
 
             retry_index = self._food_retries[food_name]
             if retry_index >= self._max_food_retries:
-                logging.warning(
-                    "expert exhausted %d retries for %s; requesting a fresh IC attempt",
-                    self._max_food_retries,
-                    food_name,
+                return self._abort_episode(
+                    q0,
+                    f"expert exhausted {self._max_food_retries} retries for {food_name}",
                 )
-                hold = np.concatenate([q0, [self._open]]).astype(np.float32)
-                return {
-                    "actions": np.repeat(hold[None], CHUNK, axis=0),
-                    "abort_episode": True,
-                }
             self._food_retries[food_name] += 1
             self._active_food = food_name
             logging.info(
