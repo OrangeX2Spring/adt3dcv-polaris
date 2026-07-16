@@ -18,7 +18,7 @@ NVIDIA_DROID = ArticulationCfg(
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
             solver_position_iteration_count=64,
-            solver_velocity_iteration_count=0,
+            solver_velocity_iteration_count=4,
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
@@ -42,15 +42,15 @@ NVIDIA_DROID = ArticulationCfg(
     actuators={
         "panda_shoulder": ImplicitActuatorCfg(
             joint_names_expr=["panda_joint[1-4]"],
-            effort_limit=87.0,
-            velocity_limit=2.175,
+            effort_limit_sim=87.0,
+            velocity_limit_sim=2.175,
             stiffness=400.0,
             damping=80.0,
         ),
         "panda_forearm": ImplicitActuatorCfg(
             joint_names_expr=["panda_joint[5-7]"],
-            effort_limit=12.0,
-            velocity_limit=2.61,
+            effort_limit_sim=12.0,
+            velocity_limit_sim=2.61,
             stiffness=400.0,
             damping=80.0,
         ),
@@ -58,8 +58,8 @@ NVIDIA_DROID = ArticulationCfg(
             joint_names_expr=["finger_joint"],
             stiffness=None,
             damping=None,
-            effort_limit=200.0,
-            velocity_limit=5.0,  # 2.175,
+            effort_limit_sim=200.0,
+            velocity_limit_sim=5.0,
         ),
     },
 )

@@ -26,6 +26,8 @@ Important tuning variables (meters / radians / control steps):
   EXPERT_IK_POS_TOL=0.004
   EXPERT_IK_ROT_TOL=0.05
   EXPERT_MAX_IK_POS_ERROR=0.12
+  EXPERT_JOINT_LIMIT_MARGIN=0.10
+  EXPERT_MAX_FOOD_RETRIES=3
   EXPERT_MIN_OBJECT_Z=-0.02
   EXPERT_MAX_OBJECT_Z=0.60
   EXPERT_MAX_OBJECT_RADIUS=1.00
@@ -115,6 +117,10 @@ class Policy(BasePolicy):
         self._max_ik_position_error = float(
             os.environ.get("EXPERT_MAX_IK_POS_ERROR", 0.12)
         )
+        self._joint_limit_margin = float(
+            os.environ.get("EXPERT_JOINT_LIMIT_MARGIN", 0.10)
+        )
+        self._max_food_retries = int(os.environ.get("EXPERT_MAX_FOOD_RETRIES", 3))
         self._min_object_z = float(os.environ.get("EXPERT_MIN_OBJECT_Z", -0.02))
         self._max_object_z = float(os.environ.get("EXPERT_MAX_OBJECT_Z", 0.60))
         self._max_object_radius = float(
@@ -133,6 +139,8 @@ class Policy(BasePolicy):
             or self._ik_pos_tol <= 0
             or self._ik_rot_tol <= 0
             or self._max_ik_position_error <= 0
+            or self._joint_limit_margin < 0
+            or self._max_food_retries <= 0
             or self._min_object_z >= self._max_object_z
             or self._max_object_radius <= 0
             or self._plan_timeout <= 0
@@ -141,7 +149,8 @@ class Policy(BasePolicy):
                 "EXPERT_MAX_DQ, EXPERT_MAX_INTERPOLATION_STEPS, and "
                 "EXPERT_VIA_DISTANCE must be positive; EXPERT_IK_POS_TOL and "
                 "EXPERT_IK_ROT_TOL must be positive; object workspace and IK "
-                "error limits must be valid; EXPERT_PLAN_TIMEOUT must be positive; "
+                "error limits, joint margin, and retry limit must be valid; "
+                "EXPERT_PLAN_TIMEOUT must be positive; "
                 "EXPERT_IK_ROT_WEIGHT must be non-negative"
             )
 
@@ -302,15 +311,24 @@ class Policy(BasePolicy):
         yaw_delta: float,
         deadline: float,
     ) -> tuple[np.ndarray, float, float]:
-        joint_limits = np.asarray(self._robot._JOINT_LIMITS, dtype=np.float32)
+        hard_limits = np.asarray(self._robot._JOINT_LIMITS, dtype=np.float32)
+        joint_limits = hard_limits.copy()
+        joint_limits[:, 0] += self._joint_limit_margin
+        joint_limits[:, 1] -= self._joint_limit_margin
+        if np.any(joint_limits[:, 0] >= joint_limits[:, 1]):
+            raise ValueError("EXPERT_JOINT_LIMIT_MARGIN is too large")
+
+        def safe_seed(base: np.ndarray) -> np.ndarray:
+            seed = np.asarray(base, dtype=np.float32).copy()
+            return np.clip(seed, joint_limits[:, 0], joint_limits[:, 1])
 
         def wrist_seed(base: np.ndarray) -> np.ndarray:
-            seed = np.asarray(base, dtype=np.float32).copy()
+            seed = safe_seed(base)
             seed[6] = np.clip(seed[6] + yaw_delta, joint_limits[6, 0], joint_limits[6, 1])
             return seed
 
         def reach_seed(base: np.ndarray) -> np.ndarray:
-            seed = np.asarray(base, dtype=np.float32).copy()
+            seed = safe_seed(base)
             seed[0] = np.clip(
                 np.arctan2(target_pose[1], target_pose[0]),
                 joint_limits[0, 0],
@@ -324,9 +342,9 @@ class Policy(BasePolicy):
 
         extended = reach_seed(q_home)
         seeds = (
-            (np.asarray(q_init, dtype=np.float32), 140, self._ik_rot_weight),
+            (safe_seed(q_init), 140, self._ik_rot_weight),
             (wrist_seed(q_init), 180, self._ik_rot_weight),
-            (np.asarray(q_home, dtype=np.float32), 220, self._ik_rot_weight),
+            (safe_seed(q_home), 220, self._ik_rot_weight),
             (extended, 260, min(self._ik_rot_weight, 0.08)),
             (wrist_seed(extended), 260, min(self._ik_rot_weight, 0.08)),
         )
@@ -629,6 +647,11 @@ class Policy(BasePolicy):
                 return {"actions": np.repeat(hold[None], CHUNK, axis=0)}
 
             retry_index = self._food_retries[food_name]
+            if retry_index >= self._max_food_retries:
+                raise RuntimeError(
+                    f"Expert exhausted {self._max_food_retries} retries for "
+                    f"{food_name}; restarting this IC"
+                )
             self._food_retries[food_name] += 1
             self._active_food = food_name
             logging.info(
