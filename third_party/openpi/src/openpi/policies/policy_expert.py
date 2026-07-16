@@ -63,6 +63,44 @@ FOOD_SPECS = (
     ("ice_cream", 4, -1.0),
 )
 FOOD_RETRY_WEIGHTS = {"grapes": 2.0, "ice_cream": 1.0}
+MAX_OBSERVED_JOINT_TURNS = 32
+OBSERVED_JOINT_LIMIT_TOLERANCE = 0.25
+
+
+def _canonicalize_revolute_joints(
+    joints: np.ndarray,
+    joint_limits: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    q = np.asarray(joints, dtype=np.float64).reshape(-1)
+    if len(q) < 7:
+        raise ValueError(f"Expected seven arm joints, got shape {q.shape}")
+    q = q[:7]
+    joint_limits = np.asarray(joint_limits, dtype=np.float64)
+    if joint_limits.shape != (7, 2):
+        raise ValueError(
+            f"Expected joint limits with shape (7, 2), got {joint_limits.shape}"
+        )
+
+    finite = np.isfinite(q)
+    centers = joint_limits.mean(axis=1)
+    turns = np.zeros(7, dtype=np.float64)
+    turns[finite] = np.rint((q[finite] - centers[finite]) / (2 * np.pi))
+    canonical = q.copy()
+    canonical[finite] -= turns[finite] * (2 * np.pi)
+    recoverable = (
+        finite
+        & (np.abs(turns) <= MAX_OBSERVED_JOINT_TURNS)
+        & (canonical >= joint_limits[:, 0] - OBSERVED_JOINT_LIMIT_TOLERANCE)
+        & (canonical <= joint_limits[:, 1] + OBSERVED_JOINT_LIMIT_TOLERANCE)
+    )
+    if not np.all(recoverable):
+        raise RuntimeError(
+            "Simulator joint state diverged; aborting this attempt: "
+            f"{q.tolist()}"
+        )
+
+    canonical = np.clip(canonical, joint_limits[:, 0], joint_limits[:, 1])
+    return canonical.astype(np.float32), turns.astype(np.int32)
 
 
 class Policy(BasePolicy):
@@ -258,29 +296,23 @@ class Policy(BasePolicy):
         return float((target * actual.inv()).magnitude())
 
     def _sanitize_observed_joints(self, joints: np.ndarray) -> np.ndarray:
-        q = np.asarray(joints, dtype=np.float32).reshape(-1)
-        if len(q) < 7:
-            raise ValueError(f"Expected seven arm joints, got shape {q.shape}")
-        q = q[:7]
         joint_limits = np.asarray(self._robot._JOINT_LIMITS, dtype=np.float32)
-        finite = np.isfinite(q)
-        severely_invalid = (
-            not np.all(finite)
-            or np.any(q < joint_limits[:, 0] - 0.25)
-            or np.any(q > joint_limits[:, 1] + 0.25)
-        )
-        if severely_invalid:
-            raise RuntimeError(
-                "Simulator joint state diverged; aborting this attempt: "
-                f"{q.tolist()}"
-            )
-        elif not np.all(
-            (q >= joint_limits[:, 0]) & (q <= joint_limits[:, 1])
-        ):
+        q, turns = _canonicalize_revolute_joints(joints, joint_limits)
+        if np.any(turns):
             logging.warning(
-                "expert clipped slightly out-of-limit observed joints %s", q.tolist()
+                "expert normalized wrapped observed joints turns=%s canonical=%s",
+                turns.tolist(),
+                q.tolist(),
             )
-        return np.clip(q, joint_limits[:, 0], joint_limits[:, 1]).astype(np.float32)
+        raw = np.asarray(joints, dtype=np.float64).reshape(-1)[:7]
+        wrapped = raw - turns.astype(np.float64) * (2 * np.pi)
+        if not np.allclose(q, wrapped, atol=1e-6):
+            logging.warning(
+                "expert clipped slightly out-of-limit observed joints raw=%s canonical=%s",
+                raw.tolist(),
+                q.tolist(),
+            )
+        return q
 
     def _validate_live_pose(self, name: str, pose: np.ndarray) -> np.ndarray:
         pose = np.asarray(pose, dtype=np.float32).reshape(-1)

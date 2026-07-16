@@ -193,6 +193,20 @@ class SceneCfg(InteractiveSceneCfg):
 
 
 ### ActionCfg ###
+PANDA_ARM_JOINT_NAMES = [f"panda_joint{index}" for index in range(1, 8)]
+PANDA_ARM_JOINT_LIMITS = (
+    (-2.8973, 2.8973),
+    (-1.7628, 1.7628),
+    (-2.8973, 2.8973),
+    (-3.0718, -0.0698),
+    (-2.8973, 2.8973),
+    (-0.0175, 3.7525),
+    (-2.8973, 2.8973),
+)
+MAX_OBSERVED_JOINT_TURNS = 32
+OBSERVED_JOINT_LIMIT_TOLERANCE = 0.25
+
+
 class BinaryJointPositionZeroToOneAction(BinaryJointPositionAction):
     # override
     def process_actions(self, actions: torch.Tensor):
@@ -231,7 +245,7 @@ class BinaryJointPositionZeroToOneActionCfg(BinaryJointPositionActionCfg):
 class ActionCfg:
     arm = mdp.JointPositionActionCfg(
         asset_name="robot",
-        joint_names=["panda_joint.*"],
+        joint_names=PANDA_ARM_JOINT_NAMES.copy(),
         preserve_order=True,
         use_default_offset=False,
     )
@@ -252,21 +266,24 @@ def arm_joint_pos(
     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ):
     robot = env.scene[asset_cfg.name]
-    joint_names = [
-        "panda_joint1",
-        "panda_joint2",
-        "panda_joint3",
-        "panda_joint4",
-        "panda_joint5",
-        "panda_joint6",
-        "panda_joint7",
-    ]
-    # get joint inidices
     joint_indices = [
-        i for i, name in enumerate(robot.data.joint_names) if name in joint_names
+        robot.data.joint_names.index(name) for name in PANDA_ARM_JOINT_NAMES
     ]
     joint_pos = robot.data.joint_pos[:, joint_indices]
-    return joint_pos
+    limits = torch.as_tensor(
+        PANDA_ARM_JOINT_LIMITS, dtype=joint_pos.dtype, device=joint_pos.device
+    )
+    centers = limits.mean(dim=1)
+    turns = torch.round((joint_pos - centers) / (2 * np.pi))
+    canonical = joint_pos - turns * (2 * np.pi)
+    recoverable = (
+        torch.isfinite(joint_pos)
+        & (torch.abs(turns) <= MAX_OBSERVED_JOINT_TURNS)
+        & (canonical >= limits[:, 0] - OBSERVED_JOINT_LIMIT_TOLERANCE)
+        & (canonical <= limits[:, 1] + OBSERVED_JOINT_LIMIT_TOLERANCE)
+    )
+    canonical = torch.clamp(canonical, min=limits[:, 0], max=limits[:, 1])
+    return torch.where(recoverable, canonical, joint_pos)
 
 
 def gripper_pos(
