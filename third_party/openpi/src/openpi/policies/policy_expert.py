@@ -25,6 +25,10 @@ Important tuning variables (meters / radians / control steps):
   EXPERT_IK_ROT_WEIGHT=0.20
   EXPERT_IK_POS_TOL=0.004
   EXPERT_IK_ROT_TOL=0.05
+  EXPERT_MAX_IK_POS_ERROR=0.12
+  EXPERT_MIN_OBJECT_Z=-0.02
+  EXPERT_MAX_OBJECT_Z=0.60
+  EXPERT_MAX_OBJECT_RADIUS=1.00
   EXPERT_PLAN_TIMEOUT=180
   EXPERT_YAW_ALIGN=1
   EXPERT_GRIP_INVERT=0
@@ -57,10 +61,6 @@ FOOD_SPECS = (
     ("ice_cream", 4, -1.0),
 )
 FOOD_RETRY_WEIGHTS = {"grapes": 2.0, "ice_cream": 1.0}
-NOMINAL_HOME = np.array(
-    [0.0, -np.pi / 4, 0.0, -3 * np.pi / 4, 0.0, np.pi / 2, np.pi / 4],
-    dtype=np.float32,
-)
 
 
 class Policy(BasePolicy):
@@ -112,6 +112,14 @@ class Policy(BasePolicy):
         self._ik_rot_weight = float(os.environ.get("EXPERT_IK_ROT_WEIGHT", 0.20))
         self._ik_pos_tol = float(os.environ.get("EXPERT_IK_POS_TOL", 0.004))
         self._ik_rot_tol = float(os.environ.get("EXPERT_IK_ROT_TOL", 0.05))
+        self._max_ik_position_error = float(
+            os.environ.get("EXPERT_MAX_IK_POS_ERROR", 0.12)
+        )
+        self._min_object_z = float(os.environ.get("EXPERT_MIN_OBJECT_Z", -0.02))
+        self._max_object_z = float(os.environ.get("EXPERT_MAX_OBJECT_Z", 0.60))
+        self._max_object_radius = float(
+            os.environ.get("EXPERT_MAX_OBJECT_RADIUS", 1.00)
+        )
         self._plan_timeout = float(os.environ.get("EXPERT_PLAN_TIMEOUT", 180))
         self._yaw_align = os.environ.get("EXPERT_YAW_ALIGN", "1") == "1"
         invert = os.environ.get("EXPERT_GRIP_INVERT", "0") == "1"
@@ -124,13 +132,16 @@ class Policy(BasePolicy):
             or self._ik_rot_weight < 0
             or self._ik_pos_tol <= 0
             or self._ik_rot_tol <= 0
+            or self._max_ik_position_error <= 0
+            or self._min_object_z >= self._max_object_z
+            or self._max_object_radius <= 0
             or self._plan_timeout <= 0
         ):
             raise ValueError(
                 "EXPERT_MAX_DQ, EXPERT_MAX_INTERPOLATION_STEPS, and "
                 "EXPERT_VIA_DISTANCE must be positive; EXPERT_IK_POS_TOL and "
-                "EXPERT_IK_ROT_TOL must be positive; EXPERT_PLAN_TIMEOUT must "
-                "be positive; "
+                "EXPERT_IK_ROT_TOL must be positive; object workspace and IK "
+                "error limits must be valid; EXPERT_PLAN_TIMEOUT must be positive; "
                 "EXPERT_IK_ROT_WEIGHT must be non-negative"
             )
 
@@ -250,15 +261,10 @@ class Policy(BasePolicy):
             or np.any(q > joint_limits[:, 1] + 0.25)
         )
         if severely_invalid:
-            fallback = self._q_home
-            if fallback is None or not np.all(np.isfinite(fallback)):
-                fallback = NOMINAL_HOME
-            logging.warning(
-                "expert rejected invalid observed joints %s; using safe fallback %s",
-                q.tolist(),
-                np.round(fallback, 3).tolist(),
+            raise RuntimeError(
+                "Simulator joint state diverged; aborting this attempt: "
+                f"{q.tolist()}"
             )
-            q = np.asarray(fallback, dtype=np.float32).copy()
         elif not np.all(
             (q >= joint_limits[:, 0]) & (q <= joint_limits[:, 1])
         ):
@@ -266,6 +272,27 @@ class Policy(BasePolicy):
                 "expert clipped slightly out-of-limit observed joints %s", q.tolist()
             )
         return np.clip(q, joint_limits[:, 0], joint_limits[:, 1]).astype(np.float32)
+
+    def _validate_live_pose(self, name: str, pose: np.ndarray) -> np.ndarray:
+        pose = np.asarray(pose, dtype=np.float32).reshape(-1)
+        if len(pose) < 7 or not np.all(np.isfinite(pose[:7])):
+            raise RuntimeError(
+                f"Simulator pose diverged for {name}; aborting this attempt: {pose.tolist()}"
+            )
+        xyz = pose[:3]
+        quaternion_norm = float(np.linalg.norm(pose[3:7]))
+        radius = float(np.linalg.norm(xyz[:2]))
+        if (
+            xyz[2] < self._min_object_z
+            or xyz[2] > self._max_object_z
+            or radius > self._max_object_radius
+            or quaternion_norm < 1e-6
+        ):
+            raise RuntimeError(
+                f"Simulator pose left the recoverable workspace for {name}; "
+                f"aborting this attempt: {pose[:7].tolist()}"
+            )
+        return pose
 
     def _solve(
         self,
@@ -377,8 +404,12 @@ class Policy(BasePolicy):
         initial_bowl_pose = self._find(ic, "bowl")
         if live_poses:
             try:
-                food_pose = self._find(live_poses, food_name)
-                bowl_pose = self._find(live_poses, "bowl")
+                food_pose = self._validate_live_pose(
+                    food_name, self._find(live_poses, food_name)
+                )
+                bowl_pose = self._validate_live_pose(
+                    "bowl", self._find(live_poses, "bowl")
+                )
             except KeyError:
                 food_pose = initial_food_pose
                 bowl_pose = initial_bowl_pose
@@ -475,6 +506,11 @@ class Policy(BasePolicy):
                     position_error,
                     np.degrees(rotation_error),
                     np.round(target_pose[:3], 3).tolist(),
+                )
+            if position_error > self._max_ik_position_error:
+                raise RuntimeError(
+                    f"Expert IK cannot safely reach {food_name} waypoint "
+                    f"{waypoint_index}: position error {position_error:.3f} m"
                 )
             interpolation_steps = max(
                 int(np.ceil(np.max(np.abs(q_target - q_previous)) / self._max_dq)), 1
