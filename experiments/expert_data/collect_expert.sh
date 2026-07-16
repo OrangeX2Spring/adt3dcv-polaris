@@ -12,9 +12,11 @@ RUN_ROOT=${POLARIS_RUN_ROOT:-/workspace/polaris/runs/expert_runs}
 COLLECTION_ID=${POLARIS_COLLECTION_ID:-$(date +%Y%m%d_%H%M%S)}
 RUNS=$RUN_ROOT/$COLLECTION_ID
 FAILED_LIST=$RUNS/failed_ics.txt
+HIGH_PROGRESS_FILE=$RUNS/high_progress_failed_ics.csv
 CURRENT_PID=""
 KEEP_FAILURES=${POLARIS_KEEP_FAILURES:-0}
 SKIP_ICS=${POLARIS_SKIP_ICS:-}
+HIGH_PROGRESS_THRESHOLD=${POLARIS_HIGH_PROGRESS_THRESHOLD:-0.8}
 
 if ! [[ $FIRST =~ ^[0-9]+$ && $LAST =~ ^[0-9]+$ \
     && $MAX_ATTEMPTS =~ ^[1-9][0-9]*$ \
@@ -24,6 +26,14 @@ if ! [[ $FIRST =~ ^[0-9]+$ && $LAST =~ ^[0-9]+$ \
 fi
 if (( FIRST > LAST )); then
   echo "first_ic must be <= last_ic" >&2
+  exit 2
+fi
+if ! python3 -c 'import math,sys
+try: value=float(sys.argv[1])
+except ValueError: raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and 0 <= value < 1 else 1)' \
+    "$HIGH_PROGRESS_THRESHOLD"; then
+  echo "POLARIS_HIGH_PROGRESS_THRESHOLD must be a finite number in [0, 1)" >&2
   exit 2
 fi
 if ! command -v timeout >/dev/null 2>&1; then
@@ -74,6 +84,7 @@ trap interrupt_collection INT TERM
 
 mkdir -p "$STAGING" "$RUNS"
 : > "$FAILED_LIST"
+printf 'ic,best_progress,attempt\n' > "$HIGH_PROGRESS_FILE"
 
 read_result() {
   python3 -c 'import csv,sys
@@ -83,6 +94,13 @@ row=rows[-1]
 success=str(row.get("success", "")).strip().lower() == "true"
 progress=row.get("progress", "")
 print("{},{}".format(str(success).lower(), progress))' "$1"
+}
+
+progress_is_greater() {
+  python3 -c 'import math,sys
+try: value=float(sys.argv[1]); reference=float(sys.argv[2])
+except ValueError: raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and value > reference else 1)' "$1" "$2"
 }
 
 run_eval() {
@@ -115,6 +133,7 @@ os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
 echo "[collect] collection=$COLLECTION_ID ICs=$FIRST..$LAST attempts=$MAX_ATTEMPTS"
 echo "[collect] attempt timeout=${ATTEMPT_TIMEOUT_SECONDS}s"
 echo "[collect] explicitly skipped ICs=${SKIP_ICS:-none}"
+echo "[collect] high-progress failure threshold: progress > ${HIGH_PROGRESS_THRESHOLD}"
 echo "[collect] runs=$RUNS"
 echo "[collect] staging=$STAGING"
 
@@ -136,6 +155,8 @@ for ic in $(seq "$FIRST" "$LAST"); do
   fi
 
   succeeded=0
+  best_progress=-1
+  best_attempt=0
   for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
     folder=$RUNS/ic${ic_tag}_a$(printf '%02d' "$attempt")
     echo "[collect] IC $ic attempt $attempt/$MAX_ATTEMPTS"
@@ -153,6 +174,10 @@ for ic in $(seq "$FIRST" "$LAST"); do
     success=${result%%,*}
     progress=${result#*,}
     echo "[collect] IC $ic attempt $attempt -> success=$success progress=$progress"
+    if progress_is_greater "$progress" "$best_progress"; then
+      best_progress=$progress
+      best_attempt=$attempt
+    fi
     if [[ $success == true ]]; then
       staged_dir=$(find "$STAGING" -maxdepth 1 -type d \
         -name "ep_ic${ic_tag}_*_success" -print -quit)
@@ -170,6 +195,11 @@ for ic in $(seq "$FIRST" "$LAST"); do
   if (( succeeded == 0 )); then
     echo "$ic" >> "$FAILED_LIST"
     echo "[collect] IC $ic FAILED after $MAX_ATTEMPTS attempts"
+    if progress_is_greater "$best_progress" "$HIGH_PROGRESS_THRESHOLD"; then
+      printf '%s,%s,%s\n' "$ic" "$best_progress" "$best_attempt" \
+        >> "$HIGH_PROGRESS_FILE"
+      echo "[collect] IC $ic noted as high-progress failure: best=$best_progress"
+    fi
   fi
 done
 
@@ -181,4 +211,12 @@ if [[ -s $FAILED_LIST ]]; then
 else
   echo "[collect] failed ICs: none"
 fi
+high_progress_count=$(( $(wc -l < "$HIGH_PROGRESS_FILE") - 1 ))
+if (( high_progress_count > 0 )); then
+  echo "[collect] failed ICs above $HIGH_PROGRESS_THRESHOLD progress:"
+  tail -n +2 "$HIGH_PROGRESS_FILE"
+else
+  echo "[collect] failed ICs above $HIGH_PROGRESS_THRESHOLD progress: none"
+fi
+echo "[collect] high-progress report: $HIGH_PROGRESS_FILE"
 python3 experiments/expert_data/summarize_collection.py "$RUNS" || true

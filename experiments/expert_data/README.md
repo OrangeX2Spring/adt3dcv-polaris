@@ -57,12 +57,15 @@ server also recovers from difficult replanning requests. Useful overrides:
 ```bash
 POLARIS_MAX_ATTEMPTS=15 bash experiments/expert_data/collect_expert.sh 0 99
 POLARIS_ATTEMPT_TIMEOUT_SECONDS=900 bash experiments/expert_data/collect_expert.sh 0 99
+POLARIS_HIGH_PROGRESS_THRESHOLD=0.8 bash experiments/expert_data/collect_expert.sh 0 99
 POLARIS_SKIP_ICS="24 57" bash experiments/expert_data/collect_expert.sh 0 99
 POLARIS_KEEP_FAILURES=1 bash experiments/expert_data/collect_expert.sh 0 0
 ```
 
 `POLARIS_SKIP_ICS` accepts comma- or space-separated IC indices that have been reviewed and accepted
 as unrealizable. Skipped ICs are reported explicitly and are not added to the run's failure list.
+The collector writes failed ICs whose best attempt exceeds `POLARIS_HIGH_PROGRESS_THRESHOLD` to
+`high_progress_failed_ics.csv` in the new run directory, including their best progress and attempt.
 
 Successful staging directories are under `runs/expert_staging/` and contain:
 
