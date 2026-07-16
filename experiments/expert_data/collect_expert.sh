@@ -6,6 +6,7 @@ set -uo pipefail
 FIRST=${1:-0}
 LAST=${2:-99}
 MAX_ATTEMPTS=${POLARIS_MAX_ATTEMPTS:-10}
+ATTEMPT_TIMEOUT_SECONDS=${POLARIS_ATTEMPT_TIMEOUT_SECONDS:-1200}
 STAGING=${POLARIS_STAGING_DIR:-/workspace/polaris/runs/expert_staging}
 RUN_ROOT=${POLARIS_RUN_ROOT:-/workspace/polaris/runs/expert_runs}
 COLLECTION_ID=${POLARIS_COLLECTION_ID:-$(date +%Y%m%d_%H%M%S)}
@@ -14,12 +15,18 @@ FAILED_LIST=$RUNS/failed_ics.txt
 CURRENT_PID=""
 KEEP_FAILURES=${POLARIS_KEEP_FAILURES:-0}
 
-if ! [[ $FIRST =~ ^[0-9]+$ && $LAST =~ ^[0-9]+$ && $MAX_ATTEMPTS =~ ^[1-9][0-9]*$ ]]; then
-  echo "usage: $0 [first_ic] [last_ic] (non-negative integers; POLARIS_MAX_ATTEMPTS > 0)" >&2
+if ! [[ $FIRST =~ ^[0-9]+$ && $LAST =~ ^[0-9]+$ \
+    && $MAX_ATTEMPTS =~ ^[1-9][0-9]*$ \
+    && $ATTEMPT_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
+  echo "usage: $0 [first_ic] [last_ic] (non-negative integers; attempts and timeout > 0)" >&2
   exit 2
 fi
 if (( FIRST > LAST )); then
   echo "first_ic must be <= last_ic" >&2
+  exit 2
+fi
+if ! command -v timeout >/dev/null 2>&1; then
+  echo "GNU timeout is required for the per-attempt watchdog" >&2
   exit 2
 fi
 
@@ -65,7 +72,9 @@ print("{},{}".format(str(success).lower(), progress))' "$1"
 run_eval() {
   local ic=$1
   local folder=$2
-  set -- uv run scripts/eval.py --environment DROID-FoodBussing --policy.port 8000 \
+  set -- timeout --foreground --signal=INT --kill-after=30s \
+    "${ATTEMPT_TIMEOUT_SECONDS}s" \
+    uv run scripts/eval.py --environment DROID-FoodBussing --policy.port 8000 \
     --rollouts 1 --fix-ic "$ic" --send-subtask-state --step-log --stop-on-success \
     --record-traj "$STAGING"
   if [[ $KEEP_FAILURES == 1 ]]; then
@@ -81,10 +90,14 @@ os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
   wait "$CURRENT_PID"
   local status=$?
   CURRENT_PID=""
+  if (( status == 124 )); then
+    echo "[collect] IC $ic attempt timed out after ${ATTEMPT_TIMEOUT_SECONDS}s" >&2
+  fi
   return "$status"
 }
 
 echo "[collect] collection=$COLLECTION_ID ICs=$FIRST..$LAST attempts=$MAX_ATTEMPTS"
+echo "[collect] attempt timeout=${ATTEMPT_TIMEOUT_SECONDS}s"
 echo "[collect] runs=$RUNS"
 echo "[collect] staging=$STAGING"
 

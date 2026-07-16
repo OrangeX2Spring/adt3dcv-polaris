@@ -50,10 +50,13 @@ bash experiments/expert_data/collect_expert.sh 0 99
 
 Each IC gets up to 10 outer attempts. One `Ctrl+C` stops the loop and its active eval process.
 Rerunning is safe: ICs with an existing staged success are skipped, while each invocation uses a
-new run directory. Useful overrides:
+new run directory. Each attempt has a 20-minute watchdog so a blocked simulator or policy request
+cannot stall the batch. Expert IK planning is separately bounded to three minutes so the policy
+server also recovers from difficult replanning requests. Useful overrides:
 
 ```bash
 POLARIS_MAX_ATTEMPTS=15 bash experiments/expert_data/collect_expert.sh 0 99
+POLARIS_ATTEMPT_TIMEOUT_SECONDS=900 bash experiments/expert_data/collect_expert.sh 0 99
 POLARIS_KEEP_FAILURES=1 bash experiments/expert_data/collect_expert.sh 0 0
 ```
 

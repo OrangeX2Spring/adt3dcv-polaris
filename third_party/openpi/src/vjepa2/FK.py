@@ -16,6 +16,8 @@ panda_fk.py — Franka Panda 正运动学，全接口支持 batch 输入
 """
 
 from __future__ import annotations
+
+import time
 import warnings
 import numpy as np
 import torch
@@ -190,6 +192,7 @@ class PandaFK:
         pos_tol: float = 2e-3,
         rot_tol: float = 5e-3,
         rot_weight: float = 1.0,
+        time_limit_s: float | None = None,
     ) -> np.ndarray:
         """
         目标 6D EE 位姿 → 7 关节角（阻尼最小二乘雅可比 IK，从 q_init7 热启动）。
@@ -204,6 +207,9 @@ class PandaFK:
 
         if rot_weight < 0:
             raise ValueError("rot_weight must be non-negative")
+        if time_limit_s is not None and time_limit_s <= 0:
+            raise ValueError("time_limit_s must be positive")
+        deadline = None if time_limit_s is None else time.monotonic() + time_limit_s
 
         lim = torch.tensor(self._JOINT_LIMITS, device=self.device)
         q_init = np.asarray(q_init7, dtype=np.float32).reshape(-1)
@@ -215,6 +221,8 @@ class PandaFK:
         q = torch.clamp(q, lim[:, 0], lim[:, 1])
 
         for _ in range(iters):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             T_cur = self._chain.forward_kinematics(q[None]).get_matrix()[0].cpu().numpy()  # (4,4)
             p_cur = T_cur[:3, 3]
             R_cur = T_cur[:3, :3]
@@ -222,7 +230,7 @@ class PandaFK:
             e_rot = Rotation.from_matrix(R_tgt @ R_cur.T).as_rotvec()  # (3,) world-frame
             if (
                 np.linalg.norm(e_pos) < pos_tol
-                and (rot_weight == 0 or np.linalg.norm(e_rot) < rot_tol)
+                and (rot_weight == 0 or rot_weight * np.linalg.norm(e_rot) < rot_tol)
             ):
                 break
             err = torch.tensor(

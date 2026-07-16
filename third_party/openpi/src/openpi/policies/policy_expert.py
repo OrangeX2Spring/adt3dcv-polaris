@@ -23,6 +23,9 @@ Important tuning variables (meters / radians / control steps):
   EXPERT_BOWL_CLEARANCE=0.13
   EXPERT_GRASP_SHIFT_MAX=0.008
   EXPERT_IK_ROT_WEIGHT=0.20
+  EXPERT_IK_POS_TOL=0.004
+  EXPERT_IK_ROT_TOL=0.05
+  EXPERT_PLAN_TIMEOUT=180
   EXPERT_YAW_ALIGN=1
   EXPERT_GRIP_INVERT=0
 """
@@ -32,6 +35,7 @@ import json
 import logging
 import os
 import pathlib
+import time
 from typing import Any, TypeAlias
 
 import numpy as np
@@ -106,6 +110,9 @@ class Policy(BasePolicy):
         self._grasp_shift_max = float(os.environ.get("EXPERT_GRASP_SHIFT_MAX", 0.008))
         self._via_distance = float(os.environ.get("EXPERT_VIA_DISTANCE", 0.15))
         self._ik_rot_weight = float(os.environ.get("EXPERT_IK_ROT_WEIGHT", 0.20))
+        self._ik_pos_tol = float(os.environ.get("EXPERT_IK_POS_TOL", 0.004))
+        self._ik_rot_tol = float(os.environ.get("EXPERT_IK_ROT_TOL", 0.05))
+        self._plan_timeout = float(os.environ.get("EXPERT_PLAN_TIMEOUT", 180))
         self._yaw_align = os.environ.get("EXPERT_YAW_ALIGN", "1") == "1"
         invert = os.environ.get("EXPERT_GRIP_INVERT", "0") == "1"
         self._closed, self._open = (0.0, 1.0) if invert else (1.0, 0.0)
@@ -115,10 +122,15 @@ class Policy(BasePolicy):
             or self._max_interpolation_steps <= 0
             or self._via_distance <= 0
             or self._ik_rot_weight < 0
+            or self._ik_pos_tol <= 0
+            or self._ik_rot_tol <= 0
+            or self._plan_timeout <= 0
         ):
             raise ValueError(
                 "EXPERT_MAX_DQ, EXPERT_MAX_INTERPOLATION_STEPS, and "
-                "EXPERT_VIA_DISTANCE must be positive; "
+                "EXPERT_VIA_DISTANCE must be positive; EXPERT_IK_POS_TOL and "
+                "EXPERT_IK_ROT_TOL must be positive; EXPERT_PLAN_TIMEOUT must "
+                "be positive; "
                 "EXPERT_IK_ROT_WEIGHT must be non-negative"
             )
 
@@ -261,6 +273,7 @@ class Policy(BasePolicy):
         q_init: np.ndarray,
         q_home: np.ndarray,
         yaw_delta: float,
+        deadline: float,
     ) -> tuple[np.ndarray, float, float]:
         joint_limits = np.asarray(self._robot._JOINT_LIMITS, dtype=np.float32)
 
@@ -297,6 +310,9 @@ class Policy(BasePolicy):
         seen: list[np.ndarray] = []
 
         for seed, iterations, rotation_weight in seeds:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             if any(np.allclose(seed, previous, atol=1e-5) for previous in seen):
                 continue
             seen.append(seed)
@@ -305,7 +321,10 @@ class Policy(BasePolicy):
                     target_pose,
                     seed,
                     iters=iterations,
+                    pos_tol=self._ik_pos_tol,
+                    rot_tol=self._ik_rot_tol,
                     rot_weight=rotation_weight,
+                    time_limit_s=remaining,
                 ),
                 dtype=np.float32,
             ).reshape(-1)
@@ -329,11 +348,12 @@ class Policy(BasePolicy):
                 best_position_error = position_error
                 best_rotation_error = rotation_error
                 best_score = score
-            if position_error < 0.010 and rotation_error < 0.35:
+            rotation_limit = 0.65 if rotation_weight <= 0.08 else 0.35
+            if position_error < 0.010 and rotation_error < rotation_limit:
                 break
 
         if best_q is None:
-            raise RuntimeError("IK produced no candidate")
+            raise TimeoutError("Expert IK planning exceeded its time limit")
         return best_q, best_position_error, best_rotation_error
 
     def _build_leg(
@@ -348,6 +368,8 @@ class Policy(BasePolicy):
     ) -> tuple[np.ndarray, int]:
         if self._q_home is None:
             raise RuntimeError("Episode home joints are not initialized")
+        planning_start = time.monotonic()
+        planning_deadline = planning_start + self._plan_timeout
 
         ic = self._poses[ic_index]
         _, _, drop_sign = self._food_spec(food_name)
@@ -427,11 +449,23 @@ class Policy(BasePolicy):
         rows: list[np.ndarray] = []
         q_previous = np.asarray(q0, dtype=np.float32)
         for waypoint_index, (xyz, rpy, gripper, dwell) in enumerate(expanded):
+            if time.monotonic() >= planning_deadline:
+                raise TimeoutError(
+                    f"Expert planning exceeded {self._plan_timeout:.0f}s for {food_name}"
+                )
             flange_xyz = np.asarray(xyz, dtype=np.float32) + [0.0, 0.0, self._tcp]
             target_pose = np.concatenate([flange_xyz, np.asarray(rpy, dtype=np.float32)])
             q_target, position_error, rotation_error = self._solve(
-                target_pose, q_previous, self._q_home, yaw_delta
+                target_pose,
+                q_previous,
+                self._q_home,
+                yaw_delta,
+                planning_deadline,
             )
+            if time.monotonic() >= planning_deadline:
+                raise TimeoutError(
+                    f"Expert planning exceeded {self._plan_timeout:.0f}s for {food_name}"
+                )
             if position_error > 0.02 or rotation_error > 0.20:
                 logging.warning(
                     "expert IK weak: food=%s waypoint=%d pos_err=%.3f m rot_err=%.1f deg "
@@ -483,6 +517,13 @@ class Policy(BasePolicy):
             bowl_distance,
             float(np.linalg.norm(food_pose[:3] - initial_food_pose[:3])),
             motion_steps,
+        )
+        logging.info(
+            "expert planning finished: IC %d food=%s retry=%d elapsed=%.1fs",
+            ic_index,
+            food_name,
+            retry_index + 1,
+            time.monotonic() - planning_start,
         )
         return plan, motion_steps
 
@@ -554,6 +595,12 @@ class Policy(BasePolicy):
             retry_index = self._food_retries[food_name]
             self._food_retries[food_name] += 1
             self._active_food = food_name
+            logging.info(
+                "expert planning start: IC %d food=%s retry=%d",
+                self._episode_ic,
+                food_name,
+                retry_index + 1,
+            )
             sim_ee_pose = (
                 None
                 if sim_ee_value is None
