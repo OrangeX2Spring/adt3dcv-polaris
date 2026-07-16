@@ -14,6 +14,7 @@ RUNS=$RUN_ROOT/$COLLECTION_ID
 FAILED_LIST=$RUNS/failed_ics.txt
 CURRENT_PID=""
 KEEP_FAILURES=${POLARIS_KEEP_FAILURES:-0}
+SKIP_ICS=${POLARIS_SKIP_ICS:-}
 
 if ! [[ $FIRST =~ ^[0-9]+$ && $LAST =~ ^[0-9]+$ \
     && $MAX_ATTEMPTS =~ ^[1-9][0-9]*$ \
@@ -29,6 +30,21 @@ if ! command -v timeout >/dev/null 2>&1; then
   echo "GNU timeout is required for the per-attempt watchdog" >&2
   exit 2
 fi
+
+is_skipped_ic() {
+  local candidate=$1
+  local skipped
+  for skipped in ${SKIP_ICS//,/ }; do
+    if ! [[ $skipped =~ ^[0-9]+$ ]]; then
+      echo "POLARIS_SKIP_ICS must contain only comma/space-separated integers" >&2
+      exit 2
+    fi
+    if [[ $candidate == "$skipped" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
 
 interrupt_collection() {
   trap - INT TERM
@@ -98,10 +114,15 @@ os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
 
 echo "[collect] collection=$COLLECTION_ID ICs=$FIRST..$LAST attempts=$MAX_ATTEMPTS"
 echo "[collect] attempt timeout=${ATTEMPT_TIMEOUT_SECONDS}s"
+echo "[collect] explicitly skipped ICs=${SKIP_ICS:-none}"
 echo "[collect] runs=$RUNS"
 echo "[collect] staging=$STAGING"
 
 for ic in $(seq "$FIRST" "$LAST"); do
+  if is_skipped_ic "$ic"; then
+    echo "[collect] IC $ic explicitly accepted as skipped; not attempting"
+    continue
+  fi
   ic_tag=$(printf '%03d' "$ic")
   existing_stage=$(find "$STAGING" -maxdepth 1 -type d \
     -name "ep_ic${ic_tag}_*_success" -print -quit)
