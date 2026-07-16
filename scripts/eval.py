@@ -222,6 +222,7 @@ def main(eval_args: EvalArgs):
                 and (rec_dir is None or _rec_now)
             )
         ):
+            episode_succeeded = bool(info["rubric"]["success"])
             if bool(getattr(policy_client, "abort_episode", False)):
                 print("[eval] policy requested an early failed-episode restart")
             policy_client.reset()
@@ -260,17 +261,19 @@ def main(eval_args: EvalArgs):
 
             bar.close()
             print(f"Episode {episode} finished. Episode length: {bar.n}")
+            episode += 1
+            video = []
+            if eval_args.stop_on_success and episode_succeeded:
+                print("[eval] success reached; stopping remaining rollouts")
+                break
+            if episode >= rollouts:
+                break
             bar = tqdm.tqdm(range(horizon))
             obs, info = env.reset(
                 object_positions=_reset_positions(episode)
             )
             if rec_dir:
                 _rec_sample(obs, 0)
-
-            episode += 1
-            video = []
-            if episode >= rollouts:
-                break
 
     env.close()
     simulation_app.close()

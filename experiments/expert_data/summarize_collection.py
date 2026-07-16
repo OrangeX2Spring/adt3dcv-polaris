@@ -30,21 +30,23 @@ def main() -> None:
 
     attempts_by_ic: dict[int, list[dict]] = defaultdict(list)
     for csv_path in sorted(args.run_dir.glob("ic*/eval_results.csv")):
-        match = re.search(r"ic(\d+)_a(\d+)", csv_path.parent.name)
+        match = re.fullmatch(r"ic(\d+)(?:_a(\d+))?", csv_path.parent.name)
         if match is None:
             continue
         rows = list(csv.DictReader(csv_path.open(newline="")))
         if not rows:
             continue
-        row = rows[-1]
-        attempts_by_ic[int(match.group(1))].append(
-            {
-                "attempt": int(match.group(2)),
-                "success": as_bool(row.get("success")),
-                "progress": float(row.get("progress", 0.0) or 0.0),
-                "metrics": tuple(as_bool(row.get(column)) for column, _ in METRICS),
-            }
-        )
+        ic_index = int(match.group(1))
+        folder_attempt = int(match.group(2)) if match.group(2) is not None else None
+        for row_index, row in enumerate(rows, start=1):
+            attempts_by_ic[ic_index].append(
+                {
+                    "attempt": folder_attempt or row_index,
+                    "success": as_bool(row.get("success")),
+                    "progress": float(row.get("progress", 0.0) or 0.0),
+                    "metrics": tuple(as_bool(row.get(column)) for column, _ in METRICS),
+                }
+            )
 
     attempts = [attempt for values in attempts_by_ic.values() for attempt in values]
     successful_ics = sum(any(attempt["success"] for attempt in values) for values in attempts_by_ic.values())

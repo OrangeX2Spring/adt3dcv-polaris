@@ -48,15 +48,19 @@ cd /workspace/polaris
 bash experiments/expert_data/collect_expert.sh 0 99
 ```
 
-Each IC gets up to 10 outer attempts. One `Ctrl+C` stops the loop and its active eval process.
-Rerunning is safe: ICs with an existing staged success are skipped, while each invocation uses a
-new run directory. Each attempt has a 20-minute watchdog so a blocked simulator or policy request
-cannot stall the batch. Expert IK planning is separately bounded to three minutes so the policy
-server also recovers from difficult replanning requests. Useful overrides:
+Each IC gets up to 10 attempts inside one Isaac Sim process, avoiding repeated CUDA/Omniverse
+startup and teardown. One `Ctrl+C` stops the loop and its active eval process. Rerunning is safe:
+ICs with an existing staged success are skipped, while a timed-out or crashed IC process resumes
+from its existing `eval_results.csv`. Each IC process has a one-hour watchdog, up to three process
+launches, and a short GPU cleanup delay between launches. A detected CUDA OOM stops the collection
+instead of incorrectly recording the remaining ICs as task failures. The collector also refuses to
+start while another `scripts/eval.py` process is active. Useful overrides:
 
 ```bash
 POLARIS_MAX_ATTEMPTS=15 bash experiments/expert_data/collect_expert.sh 0 99
-POLARIS_ATTEMPT_TIMEOUT_SECONDS=900 bash experiments/expert_data/collect_expert.sh 0 99
+POLARIS_BATCH_TIMEOUT_SECONDS=5400 bash experiments/expert_data/collect_expert.sh 0 99
+POLARIS_MAX_PROCESS_RESTARTS=5 bash experiments/expert_data/collect_expert.sh 0 99
+POLARIS_PROCESS_COOLDOWN_SECONDS=20 bash experiments/expert_data/collect_expert.sh 0 99
 POLARIS_HIGH_PROGRESS_THRESHOLD=0.8 bash experiments/expert_data/collect_expert.sh 0 99
 POLARIS_SKIP_ICS="24 57" bash experiments/expert_data/collect_expert.sh 0 99
 POLARIS_KEEP_FAILURES=1 bash experiments/expert_data/collect_expert.sh 0 0
