@@ -18,6 +18,7 @@ class DroidJointPosClient(InferenceClient):
         self.pred_action_chunk = None
         self.open_loop_horizon = args.open_loop_horizon
         self.abort_episode = False
+        self.abort_reason = None
 
     @property
     def rerender(self) -> bool:
@@ -41,6 +42,7 @@ class DroidJointPosClient(InferenceClient):
         self.pred_action_chunk = None
         self._pending_episode_reset = True
         self.abort_episode = False
+        self.abort_reason = None
 
     def infer(
         self,
@@ -85,6 +87,8 @@ class DroidJointPosClient(InferenceClient):
             server_response = self.client.infer(request_data)
             self.pred_action_chunk = server_response["actions"]
             self.abort_episode = bool(server_response.get("abort_episode", False))
+            reason = server_response.get("abort_reason")
+            self.abort_reason = None if reason is None else str(reason)
             both = np.concatenate([exterior_image, wrist_image], axis=1)
 
         if return_viz and both is None:

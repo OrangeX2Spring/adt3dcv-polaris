@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
 
+from openpi.policies.policy_expert import Policy
+from openpi.policies.policy_expert import RecoverableExpertError
 from openpi.policies.policy_expert import _canonicalize_revolute_joints
 from vjepa2.FK import PandaFK
 
@@ -59,6 +61,53 @@ def test_rejects_extreme_turn_count():
 
     with pytest.raises(RuntimeError, match="Simulator joint state diverged"):
         _canonicalize_revolute_joints(raw, PandaFK._JOINT_LIMITS)
+
+
+def test_rejects_reported_joint_six_divergence():
+    raw = np.array(
+        [
+            -0.50939953,
+            0.2298124,
+            0.10433729,
+            -2.07029057,
+            -0.01091915,
+            4.94146442,
+            -1.73471487,
+        ]
+    )
+
+    with pytest.raises(RecoverableExpertError, match="Simulator joint state diverged"):
+        _canonicalize_revolute_joints(raw, PandaFK._JOINT_LIMITS)
+
+
+def test_infer_returns_abort_for_recoverable_failure(monkeypatch):
+    policy = Policy.__new__(Policy)
+    policy._open = 0.0
+
+    def fail_infer(obs):
+        raise RecoverableExpertError("simulator diverged")
+
+    monkeypatch.setattr(policy, "_infer_impl", fail_infer)
+
+    response = policy.infer({})
+
+    assert response["abort_episode"] is True
+    assert response["abort_reason"] == "simulator diverged"
+    assert response["actions"].shape == (16, 8)
+    assert np.all(np.isfinite(response["actions"]))
+
+
+@pytest.mark.parametrize("error", [RuntimeError("bug"), TimeoutError("bug")])
+def test_infer_does_not_hide_unexpected_errors(monkeypatch, error):
+    policy = Policy.__new__(Policy)
+
+    def fail_infer(obs):
+        raise error
+
+    monkeypatch.setattr(policy, "_infer_impl", fail_infer)
+
+    with pytest.raises(type(error), match="bug"):
+        policy.infer({})
 
 
 def test_clips_small_limit_overshoot():

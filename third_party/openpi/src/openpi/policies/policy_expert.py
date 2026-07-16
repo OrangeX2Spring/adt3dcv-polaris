@@ -65,6 +65,14 @@ FOOD_SPECS = (
 FOOD_RETRY_WEIGHTS = {"grapes": 2.0, "ice_cream": 1.0}
 MAX_OBSERVED_JOINT_TURNS = 32
 OBSERVED_JOINT_LIMIT_TOLERANCE = 0.25
+ABORT_HOLD_JOINTS = np.array(
+    [0.0, -np.pi / 5, 0.0, -4 * np.pi / 5, 0.0, 3 * np.pi / 5, 0.0],
+    dtype=np.float32,
+)
+
+
+class RecoverableExpertError(RuntimeError):
+    """A simulator or planning failure that should abort only the current episode."""
 
 
 def _canonicalize_revolute_joints(
@@ -94,7 +102,7 @@ def _canonicalize_revolute_joints(
         & (canonical <= joint_limits[:, 1] + OBSERVED_JOINT_LIMIT_TOLERANCE)
     )
     if not np.all(recoverable):
-        raise RuntimeError(
+        raise RecoverableExpertError(
             "Simulator joint state diverged; aborting this attempt: "
             f"{q.tolist()}"
         )
@@ -317,7 +325,7 @@ class Policy(BasePolicy):
     def _validate_live_pose(self, name: str, pose: np.ndarray) -> np.ndarray:
         pose = np.asarray(pose, dtype=np.float32).reshape(-1)
         if len(pose) < 7 or not np.all(np.isfinite(pose[:7])):
-            raise RuntimeError(
+            raise RecoverableExpertError(
                 f"Simulator pose diverged for {name}; aborting this attempt: {pose.tolist()}"
             )
         xyz = pose[:3]
@@ -329,7 +337,7 @@ class Policy(BasePolicy):
             or radius > self._max_object_radius
             or quaternion_norm < 1e-6
         ):
-            raise RuntimeError(
+            raise RecoverableExpertError(
                 f"Simulator pose left the recoverable workspace for {name}; "
                 f"aborting this attempt: {pose[:7].tolist()}"
             )
@@ -430,7 +438,9 @@ class Policy(BasePolicy):
                 break
 
         if best_q is None:
-            raise TimeoutError("Expert IK planning exceeded its time limit")
+            if time.monotonic() >= deadline:
+                raise RecoverableExpertError("Expert IK planning exceeded its time limit")
+            raise RecoverableExpertError("Expert IK found no valid solution")
         return best_q, best_position_error, best_rotation_error
 
     def _build_leg(
@@ -452,17 +462,13 @@ class Policy(BasePolicy):
         _, _, drop_sign = self._food_spec(food_name)
         initial_food_pose = self._find(ic, food_name)
         initial_bowl_pose = self._find(ic, "bowl")
-        if live_poses:
-            try:
-                food_pose = self._validate_live_pose(
-                    food_name, self._find(live_poses, food_name)
-                )
-                bowl_pose = self._validate_live_pose(
-                    "bowl", self._find(live_poses, "bowl")
-                )
-            except KeyError:
-                food_pose = initial_food_pose
-                bowl_pose = initial_bowl_pose
+        if live_poses is not None:
+            food_pose = self._validate_live_pose(
+                food_name, self._find(live_poses, food_name)
+            )
+            bowl_pose = self._validate_live_pose(
+                "bowl", self._find(live_poses, "bowl")
+            )
         else:
             food_pose = initial_food_pose
             bowl_pose = initial_bowl_pose
@@ -531,7 +537,7 @@ class Policy(BasePolicy):
         q_previous = np.asarray(q0, dtype=np.float32)
         for waypoint_index, (xyz, rpy, gripper, dwell) in enumerate(expanded):
             if time.monotonic() >= planning_deadline:
-                raise TimeoutError(
+                raise RecoverableExpertError(
                     f"Expert planning exceeded {self._plan_timeout:.0f}s for {food_name}"
                 )
             flange_xyz = np.asarray(xyz, dtype=np.float32) + [0.0, 0.0, self._tcp]
@@ -544,7 +550,7 @@ class Policy(BasePolicy):
                 planning_deadline,
             )
             if time.monotonic() >= planning_deadline:
-                raise TimeoutError(
+                raise RecoverableExpertError(
                     f"Expert planning exceeded {self._plan_timeout:.0f}s for {food_name}"
                 )
             if position_error > 0.02 or rotation_error > 0.20:
@@ -558,7 +564,7 @@ class Policy(BasePolicy):
                     np.round(target_pose[:3], 3).tolist(),
                 )
             if position_error > self._max_ik_position_error:
-                raise RuntimeError(
+                raise RecoverableExpertError(
                     f"Expert IK cannot safely reach {food_name} waypoint "
                     f"{waypoint_index}: position error {position_error:.3f} m"
                 )
@@ -638,8 +644,23 @@ class Policy(BasePolicy):
         self._food_retries = {spec[0]: 0 for spec in FOOD_SPECS}
         logging.info("expert episode reset: IC %d episode-attempt %d", ic_index, self._episode_attempt)
 
+    def _abort_episode_response(self, reason: str) -> dict:
+        hold = np.concatenate([ABORT_HOLD_JOINTS, [self._open]]).astype(np.float32)
+        logging.warning("expert aborting current episode without another simulator step: %s", reason)
+        return {
+            "actions": np.repeat(hold[None], CHUNK, axis=0),
+            "abort_episode": True,
+            "abort_reason": reason,
+        }
+
     @override
     def infer(self, obs: dict, *, noise: Any = None) -> dict:
+        try:
+            return self._infer_impl(obs)
+        except RecoverableExpertError as error:
+            return self._abort_episode_response(str(error))
+
+    def _infer_impl(self, obs: dict) -> dict:
         episode_reset = bool(obs.pop("_episode_reset", False))
         ic_index_value = obs.pop("subtask/ic_index", None)
         done_value = obs.pop("subtask/done", None)
@@ -680,16 +701,10 @@ class Policy(BasePolicy):
 
             retry_index = self._food_retries[food_name]
             if retry_index >= self._max_food_retries:
-                logging.warning(
-                    "expert exhausted %d retries for %s; requesting a fresh IC attempt",
-                    self._max_food_retries,
-                    food_name,
+                return self._abort_episode_response(
+                    f"Expert exhausted {self._max_food_retries} retries for {food_name}; "
+                    "requesting a fresh IC attempt"
                 )
-                hold = np.concatenate([q0, [self._open]]).astype(np.float32)
-                return {
-                    "actions": np.repeat(hold[None], CHUNK, axis=0),
-                    "abort_episode": True,
-                }
             self._food_retries[food_name] += 1
             self._active_food = food_name
             logging.info(

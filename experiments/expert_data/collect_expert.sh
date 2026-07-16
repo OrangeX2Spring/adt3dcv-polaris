@@ -228,8 +228,26 @@ for ic in $(seq "$FIRST" "$LAST"); do
       fi
       exit "$CUDA_OOM_STATUS"
     fi
-    if (( status != 0 )); then
-      echo "[collect] IC $ic process launch $process_launch exited with status $status" >&2
+    if (( status != 0 && status != 124 )); then
+      fatal_log=$folder/eval_launch_$(printf '%02d' "$process_launch").log
+      printf 'ic=%s status=%s log=%s\n' "$ic" "$status" "$fatal_log" \
+        > "$RUNS/fatal_eval_error.txt"
+      echo "[collect] IC $ic eval crashed with status $status; stopping the collection" >&2
+      echo "[collect] log: $fatal_log" >&2
+      exit "$status"
+    fi
+    if (( status == 0 )); then
+      csv_path=$folder/eval_results.csv
+      if ! post_state=$(read_collection_state "$csv_path"); then
+        echo "[collect] IC $ic eval exited cleanly without readable results; stopping" >&2
+        exit 1
+      fi
+      IFS=, read -r completed_attempts succeeded best_progress best_attempt \
+        <<< "$post_state"
+      if [[ $succeeded != true ]] && (( completed_attempts < MAX_ATTEMPTS )); then
+        echo "[collect] IC $ic eval exited early after $completed_attempts/$MAX_ATTEMPTS attempts; stopping" >&2
+        exit 1
+      fi
     fi
     if (( PROCESS_COOLDOWN_SECONDS > 0 )); then
       echo "[collect] waiting ${PROCESS_COOLDOWN_SECONDS}s for GPU process cleanup"
@@ -254,6 +272,7 @@ for ic in $(seq "$FIRST" "$LAST"); do
     fi
     echo "[collect] IC $ic succeeded but its staged training files are incomplete" >&2
     echo "$ic" >> "$ERROR_LIST"
+    exit 1
   elif (( completed_attempts >= MAX_ATTEMPTS )); then
     echo "$ic" >> "$FAILED_LIST"
     echo "[collect] IC $ic FAILED after $MAX_ATTEMPTS attempts"
@@ -289,4 +308,4 @@ else
   echo "[collect] failed ICs above $HIGH_PROGRESS_THRESHOLD progress: none"
 fi
 echo "[collect] high-progress report: $HIGH_PROGRESS_FILE"
-python3 experiments/expert_data/summarize_collection.py "$RUNS" || true
+python3 experiments/expert_data/summarize_collection.py "$RUNS"

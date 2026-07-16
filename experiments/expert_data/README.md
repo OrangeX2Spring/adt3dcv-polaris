@@ -22,26 +22,7 @@ uv run scripts/serve_policy.py --port 8000 \
 
 The startup log must say `Adaptive expert ready: 100 ICs`.
 
-## 2. Run the repair gate
-
-Use fresh test directories so previously staged successes do not get skipped. ICs 0 and 70 are
-known-success controls; ICs 3, 24, and 57 are far-reach failures from the first batch.
-
-```bash
-cd /workspace/polaris
-for ic in 0 3 24 57 70; do
-  POLARIS_MAX_ATTEMPTS=3 \
-  POLARIS_KEEP_FAILURES=1 \
-  POLARIS_STAGING_DIR=/workspace/polaris/runs/expert_staging_repair_gate \
-  POLARIS_RUN_ROOT=/workspace/polaris/runs/expert_runs_repair_gate \
-  bash experiments/expert_data/collect_expert.sh "$ic" "$ic"
-done
-```
-
-Do not start another full collection unless both control ICs and at least two of the three hard ICs
-succeed. Each run prints criterion pass rates and failed-stage patterns automatically.
-
-## 3. Collect all ICs
+## 2. Collect all ICs
 
 ```bash
 cd /workspace/polaris
@@ -50,11 +31,17 @@ bash experiments/expert_data/collect_expert.sh 0 99
 
 Each IC gets up to 10 attempts inside one Isaac Sim process, avoiding repeated CUDA/Omniverse
 startup and teardown. One `Ctrl+C` stops the loop and its active eval process. Rerunning is safe:
-ICs with an existing staged success are skipped, while a timed-out or crashed IC process resumes
-from its existing `eval_results.csv`. Each IC process has a one-hour watchdog, up to three process
+ICs with an existing staged success are skipped, while a timed-out IC process resumes from its
+existing `eval_results.csv`. Each IC process has a one-hour watchdog, up to three process
 launches, and a short GPU cleanup delay between launches. A detected CUDA OOM stops the collection
 instead of incorrectly recording the remaining ICs as task failures. The collector also refuses to
-start while another `scripts/eval.py` process is active. Useful overrides:
+start while another `scripts/eval.py` process is active. Any other eval crash, clean exit without
+complete results, or incomplete staged success stops immediately instead of being retried or
+reported as an IC failure. Useful overrides:
+
+Simulator joint divergence, invalid live object poses, and safe-planning failures abort only the
+current rollout. `eval.py` records its current rubric progress and resets without applying another
+action, so the expert server and the remaining attempts continue running.
 
 ```bash
 POLARIS_MAX_ATTEMPTS=15 bash experiments/expert_data/collect_expert.sh 0 99
@@ -80,7 +67,7 @@ Successful staging directories are under `runs/expert_staging/` and contain:
 The normal collector discards failed staging data. Set `POLARIS_KEEP_FAILURES=1` only when a
 failure video is needed for diagnosis.
 
-## 4. Pack training data
+## 3. Pack training data
 
 ```bash
 cd /workspace/polaris/third_party/openpi

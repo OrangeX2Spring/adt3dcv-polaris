@@ -187,44 +187,49 @@ def main(eval_args: EvalArgs):
             action, viz = policy_client.infer(obs, language_instruction)
         if viz is not None:
             video.append(viz)
+        policy_aborted = bool(getattr(policy_client, "abort_episode", False))
         _rec_now = rec_dir is not None and (bar.n + 1) % REC_EVERY == 0
-        obs, rew, term, trunc, info = env.step(
-            torch.tensor(action).reshape(1, -1),
-            # force a fresh (expensive) splat render on recorded steps: between chunk
-            # boundaries the cheap path may serve stale frames
-            expensive=policy_client.rerender or _rec_now,
-        )
-        if _rec_now:
-            _rec_sample(obs, bar.n + 1)
-        if eval_args.step_log:
-            step_records.append(
-                {
-                    "step": bar.n,
-                    "frame": max(0, len(video) - 1),
-                    "progress": float(info["rubric"]["progress"]),
-                    **{
-                        k: bool(v)
-                        for k, v in info["rubric"]["metrics"].items()
-                        if k.endswith("_ever")
-                    },
-                }
+        episode_finished = policy_aborted
+        if not episode_finished:
+            obs, rew, term, trunc, info = env.step(
+                torch.tensor(action).reshape(1, -1),
+                # force a fresh (expensive) splat render on recorded steps: between chunk
+                # boundaries the cheap path may serve stale frames
+                expensive=policy_client.rerender or _rec_now,
             )
+            if _rec_now:
+                _rec_sample(obs, bar.n + 1)
+            if eval_args.step_log:
+                step_records.append(
+                    {
+                        "step": bar.n,
+                        "frame": max(0, len(video) - 1),
+                        "progress": float(info["rubric"]["progress"]),
+                        **{
+                            k: bool(v)
+                            for k, v in info["rubric"]["metrics"].items()
+                            if k.endswith("_ever")
+                        },
+                    }
+                )
+            episode_finished = bool(term[0] or trunc[0])
 
         bar.update(1)
-        if (
-            term[0]
-            or trunc[0]
+        episode_finished = bool(
+            episode_finished
             or bar.n >= horizon
-            or bool(getattr(policy_client, "abort_episode", False))
             or (
                 eval_args.stop_on_success
                 and info["rubric"]["success"]
                 and (rec_dir is None or _rec_now)
             )
-        ):
+        )
+        if episode_finished:
             episode_succeeded = bool(info["rubric"]["success"])
-            if bool(getattr(policy_client, "abort_episode", False)):
-                print("[eval] policy requested an early failed-episode restart")
+            if policy_aborted:
+                abort_reason = getattr(policy_client, "abort_reason", None)
+                suffix = f": {abort_reason}" if abort_reason else ""
+                print(f"[eval] policy aborted before env.step; restarting failed episode{suffix}")
             policy_client.reset()
 
             # Save video and metadata
