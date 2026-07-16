@@ -12,6 +12,11 @@ Important tuning variables (meters / radians / control steps):
   EXPERT_TCP_OFFSET=0.105
   EXPERT_GRASP_OFFSET=0.02
   EXPERT_GRASP_OFFSET_GRAPES=0.005
+  EXPERT_FAR_REACH_THRESHOLD=0.54
+  EXPERT_FAR_ICE_GRASP_BONUS=0.02
+  EXPERT_ICE_DWELL_BONUS=6
+  EXPERT_ICE_PRELIFT=0.06
+  EXPERT_ICE_PRELIFT_DWELL=4
   EXPERT_HOVER=0.12
   EXPERT_TRANSIT=0.20
   EXPERT_DROP=0.09
@@ -98,6 +103,17 @@ class Policy(BasePolicy):
         self._grasp_off_grapes = float(
             os.environ.get("EXPERT_GRASP_OFFSET_GRAPES", 0.005)
         )
+        self._far_reach_threshold = float(
+            os.environ.get("EXPERT_FAR_REACH_THRESHOLD", 0.54)
+        )
+        self._far_ice_grasp_bonus = float(
+            os.environ.get("EXPERT_FAR_ICE_GRASP_BONUS", 0.02)
+        )
+        self._ice_dwell_bonus = int(os.environ.get("EXPERT_ICE_DWELL_BONUS", 6))
+        self._ice_prelift = float(os.environ.get("EXPERT_ICE_PRELIFT", 0.06))
+        self._ice_prelift_dwell = int(
+            os.environ.get("EXPERT_ICE_PRELIFT_DWELL", 4)
+        )
         self._hover = float(os.environ.get("EXPERT_HOVER", 0.12))
         self._transit = float(os.environ.get("EXPERT_TRANSIT", 0.20))
         self._drop = float(os.environ.get("EXPERT_DROP", 0.09))
@@ -134,6 +150,11 @@ class Policy(BasePolicy):
         if (
             self._max_dq <= 0
             or self._max_interpolation_steps <= 0
+            or self._far_reach_threshold <= 0
+            or self._far_ice_grasp_bonus < 0
+            or self._ice_dwell_bonus < 0
+            or self._ice_prelift < 0
+            or self._ice_prelift_dwell < 0
             or self._via_distance <= 0
             or self._ik_rot_weight < 0
             or self._ik_pos_tol <= 0
@@ -147,7 +168,9 @@ class Policy(BasePolicy):
         ):
             raise ValueError(
                 "EXPERT_MAX_DQ, EXPERT_MAX_INTERPOLATION_STEPS, and "
-                "EXPERT_VIA_DISTANCE must be positive; EXPERT_IK_POS_TOL and "
+                "EXPERT_FAR_REACH_THRESHOLD must be positive; grasp bonuses "
+                "and dwell values must be non-negative; EXPERT_VIA_DISTANCE "
+                "must be positive; EXPERT_IK_POS_TOL and "
                 "EXPERT_IK_ROT_TOL must be positive; object workspace and IK "
                 "error limits, joint margin, and retry limit must be valid; "
                 "EXPERT_PLAN_TIMEOUT must be positive; "
@@ -439,7 +462,20 @@ class Policy(BasePolicy):
             self._grasp_off_grapes if food_name == "grapes" else self._grasp_off
         )
         variant_index = (self._episode_attempt - 1 + retry_index) % GRASP_VARIANTS
-        grasp_offset = base_grasp_offset + GRASP_HEIGHT_DELTAS[variant_index]
+        food_radius = float(np.linalg.norm(initial_food_pose[:2]))
+        far_ice_bonus = (
+            self._far_ice_grasp_bonus
+            if food_name == "ice_cream" and food_radius >= self._far_reach_threshold
+            else 0.0
+        )
+        grasp_offset = (
+            base_grasp_offset
+            + far_ice_bonus
+            + GRASP_HEIGHT_DELTAS[variant_index]
+        )
+        grasp_dwell = self._dwell + (
+            self._ice_dwell_bonus if food_name == "ice_cream" else 0
+        )
 
         seed = 100_000 * ic_index + 1_000 * self._episode_attempt + 10 * retry_index
         seed += 1 if food_name == "ice_cream" else 2
@@ -471,15 +507,28 @@ class Policy(BasePolicy):
 
         drop = np.asarray(bowl_xyz, dtype=np.float64).copy()
         drop[0] += drop_sign * self._drop_spread
-        waypoints = (
+        waypoints = [
             (target + [0.0, 0.0, self._hover], grasp_rpy, self._open, 0),
             (target + [0.0, 0.0, grasp_offset], grasp_rpy, self._open, 0),
-            (target + [0.0, 0.0, grasp_offset], grasp_rpy, self._closed, self._dwell),
-            (target + [0.0, 0.0, self._transit], grasp_rpy, self._closed, 0),
-            (drop + [0.0, 0.0, self._transit], grasp_rpy, self._closed, 0),
-            (drop + [0.0, 0.0, self._drop], grasp_rpy, self._closed, 0),
-            (drop + [0.0, 0.0, self._drop], grasp_rpy, self._open, self._dwell),
-            (drop + [0.0, 0.0, self._transit], grasp_rpy, self._open, 0),
+            (target + [0.0, 0.0, grasp_offset], grasp_rpy, self._closed, grasp_dwell),
+        ]
+        if food_name == "ice_cream" and self._ice_prelift > 0:
+            waypoints.append(
+                (
+                    target + [0.0, 0.0, grasp_offset + self._ice_prelift],
+                    grasp_rpy,
+                    self._closed,
+                    self._ice_prelift_dwell,
+                )
+            )
+        waypoints.extend(
+            [
+                (target + [0.0, 0.0, self._transit], grasp_rpy, self._closed, 0),
+                (drop + [0.0, 0.0, self._transit], grasp_rpy, self._closed, 0),
+                (drop + [0.0, 0.0, self._drop], grasp_rpy, self._closed, 0),
+                (drop + [0.0, 0.0, self._drop], grasp_rpy, self._open, self._dwell),
+                (drop + [0.0, 0.0, self._transit], grasp_rpy, self._open, 0),
+            ]
         )
 
         expanded: list[tuple[np.ndarray, np.ndarray, float, int]] = []
@@ -557,7 +606,8 @@ class Policy(BasePolicy):
 
         logging.info(
             "expert leg: IC %d episode %d food=%s retry=%d variant=%d mode=%s "
-            "yaw=%.1fdeg grasp_z=%.3f shift=%.3f bowl_distance=%.3f moved=%.3f "
+            "yaw=%.1fdeg grasp_z=%.3f far_bonus=%.3f shift=%.3f "
+            "bowl_distance=%.3f moved=%.3f "
             "-> %d motion steps",
             ic_index,
             self._episode_attempt,
@@ -567,6 +617,7 @@ class Policy(BasePolicy):
             orientation_mode,
             np.degrees(yaw_delta),
             grasp_offset,
+            far_ice_bonus,
             grasp_shift,
             bowl_distance,
             float(np.linalg.norm(food_pose[:3] - initial_food_pose[:3])),
