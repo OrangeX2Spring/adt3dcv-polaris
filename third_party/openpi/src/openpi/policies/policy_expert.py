@@ -648,10 +648,16 @@ class Policy(BasePolicy):
 
             retry_index = self._food_retries[food_name]
             if retry_index >= self._max_food_retries:
-                raise RuntimeError(
-                    f"Expert exhausted {self._max_food_retries} retries for "
-                    f"{food_name}; restarting this IC"
+                logging.warning(
+                    "expert exhausted %d retries for %s; requesting a fresh IC attempt",
+                    self._max_food_retries,
+                    food_name,
                 )
+                hold = np.concatenate([q0, [self._open]]).astype(np.float32)
+                return {
+                    "actions": np.repeat(hold[None], CHUNK, axis=0),
+                    "abort_episode": True,
+                }
             self._food_retries[food_name] += 1
             self._active_food = food_name
             logging.info(

@@ -17,6 +17,7 @@ class DroidJointPosClient(InferenceClient):
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk = None
         self.open_loop_horizon = args.open_loop_horizon
+        self.abort_episode = False
 
     @property
     def rerender(self) -> bool:
@@ -39,6 +40,7 @@ class DroidJointPosClient(InferenceClient):
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk = None
         self._pending_episode_reset = True
+        self.abort_episode = False
 
     def infer(
         self,
@@ -82,6 +84,7 @@ class DroidJointPosClient(InferenceClient):
                     request_data["subtask/ee_pose"] = subtask_state["ee_pose"]
             server_response = self.client.infer(request_data)
             self.pred_action_chunk = server_response["actions"]
+            self.abort_episode = bool(server_response.get("abort_episode", False))
             both = np.concatenate([exterior_image, wrist_image], axis=1)
 
         if return_viz and both is None:

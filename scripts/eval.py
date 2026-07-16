@@ -215,12 +215,15 @@ def main(eval_args: EvalArgs):
             term[0]
             or trunc[0]
             or bar.n >= horizon
+            or bool(getattr(policy_client, "abort_episode", False))
             or (
                 eval_args.stop_on_success
                 and info["rubric"]["success"]
                 and (rec_dir is None or _rec_now)
             )
         ):
+            if bool(getattr(policy_client, "abort_episode", False)):
+                print("[eval] policy requested an early failed-episode restart")
             policy_client.reset()
 
             # Save video and metadata
