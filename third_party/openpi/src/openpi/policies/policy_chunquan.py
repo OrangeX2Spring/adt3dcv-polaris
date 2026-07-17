@@ -5,9 +5,8 @@ Differences vs policy_jepa2 (the fixed single-goal verifier):
   - goal_image_path is a ROOT DIR of per-IC subtask goals: <root>/ic<k>/c<j>_<name>.png
     (produced by experiments/jepa_verifier/extract_subtask_goals.py).
   - eval sends "subtask/ic_index" (int) and "subtask/done" (6 bools, c0..c5) per request
-    (scripts/eval.py --send-subtask-state). Oracle switching: goals of DONE subtasks are
-    excluded; among incomplete ones the ACTIVE goal is the argmin of current-frame energy
-    (order-agnostic: pi0.5 sometimes does grapes first).
+    (scripts/eval.py --send-subtask-state). Each food exposes only its next unfinished stage;
+    the ACTIVE goal is the lower-current-energy member of that two-food frontier.
   - Spread gate: only override candidate 0 when the candidates' relative energy spread
     exceeds VJEPA_SPREAD_GATE (default 0.02). The horizon sweep showed usable signal only
     ~1-2 video frames from subtask completion; everywhere else ranking is noise.
@@ -39,6 +38,7 @@ from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.policies.subtask_frontier import subtask_frontier
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 import torchvision.transforms as T
@@ -215,62 +215,58 @@ class Policy(BasePolicy):
         if ic_index is not None:
             goals = self._goals_for_ic(int(ic_index))
             done = list(done) if done is not None else [False] * NUM_SUBTASKS
-            incomplete = [j for j in range(NUM_SUBTASKS) if not done[j] and goals[j] is not None]
-            if not incomplete:  # everything done (or no goals) -> just run candidate 0
-                incomplete = [j for j in range(NUM_SUBTASKS) if goals[j] is not None][-1:]
+            frontier = subtask_frontier(done, [goal is not None for goal in goals])
+            log.update(frontier=frontier, executed_idx=executed_idx, shadow=self._shadow)
+            if frontier:
+                # A1 fix: encode the RAW uint8 camera frame, matching the goal path exactly.
+                raw_base = np.asarray(obs["observation/exterior_image_1_left"])
+                if np.issubdtype(raw_base.dtype, np.floating):
+                    raw_base = (255 * raw_base).astype(np.uint8)
+                if raw_base.shape[0] == 3:
+                    raw_base = np.transpose(raw_base, (1, 2, 0))
+                frame = self._transform(raw_base)
+                clip = np.expand_dims(np.stack([frame, frame], axis=0), axis=0)
+                frames_tensor = (
+                    torch.from_numpy(clip).float().permute(0, 2, 1, 3, 4).to(self._vjepa_device)
+                )
 
-            # A1 fix: encode the RAW uint8 camera frame, matching the goal path exactly.
-            raw_base = np.asarray(obs["observation/exterior_image_1_left"])
-            if np.issubdtype(raw_base.dtype, np.floating):
-                raw_base = (255 * raw_base).astype(np.uint8)
-            if raw_base.shape[0] == 3:
-                raw_base = np.transpose(raw_base, (1, 2, 0))
-            frame = self._transform(raw_base)
-            clip = np.expand_dims(np.stack([frame, frame], axis=0), axis=0)
-            frames_tensor = (
-                torch.from_numpy(clip).float().permute(0, 2, 1, 3, 4).to(self._vjepa_device)
-            )
+                actions_joint = outputs["actions"][:, :, :8]
+                # A2 fix: 4 steps of ~0.27s each, matching DROID 4fps training granularity.
+                actions_joint_downsampled = actions_joint[:, [3, 7, 11, 15], :]
+                curr_state = np.array(outputs["state"][:, :8])[:, np.newaxis, :]
+                full_traj = np.concatenate([curr_state, np.array(actions_joint_downsampled)], axis=1)
+                result = self._robot.convert_trajectory(full_traj)
+                ee_actions = torch.from_numpy(result["actions"]).float().to(self._vjepa_device)
+                ee_states = torch.from_numpy(result["states"]).float().to(self._vjepa_device)
 
-            actions_joint = outputs["actions"][:, :, :8]
-            # A2 fix: 4 steps of ~0.27s each, matching DROID 4fps training granularity.
-            actions_joint_downsampled = actions_joint[:, [3, 7, 11, 15], :]
-            curr_state = np.array(outputs["state"][:, :8])[:, np.newaxis, :]
-            full_traj = np.concatenate([curr_state, np.array(actions_joint_downsampled)], axis=1)
-            result = self._robot.convert_trajectory(full_traj)
-            ee_actions = torch.from_numpy(result["actions"]).float().to(self._vjepa_device)
-            ee_states = torch.from_numpy(result["states"]).float().to(self._vjepa_device)
+                with torch.inference_mode():
+                    z_current = self._encoder(frames_tensor)[:, -self._tokens_per_frame:, :]
+                    z_current = F.layer_norm(z_current, (z_current.size(-1),))
+                    current_e = {j: F.l1_loss(z_current, goals[j]).item() for j in frontier}
+                    active = min(current_e, key=current_e.get)
+                    z_hat = rollout.forward_actions(z_current, self._predictor, ee_states, ee_actions)
+                    losses = rollout.loss_fn(z_hat, goals[active])  # list[10]
 
-            with torch.inference_mode():
-                z_current = self._encoder(frames_tensor)[:, -self._tokens_per_frame:, :]
-                z_current = F.layer_norm(z_current, (z_current.size(-1),))
-                # Active goal = incomplete subtask nearest to the CURRENT frame (order-agnostic).
-                current_e = {j: F.l1_loss(z_current, goals[j]).item() for j in incomplete}
-                active = min(current_e, key=current_e.get)
-                # Rank candidates by predicted energy to the active goal.
-                z_hat = rollout.forward_actions(z_current, self._predictor, ee_states, ee_actions)
-                losses = rollout.loss_fn(z_hat, goals[active])  # list[10]
-
-            best_idx = int(np.argmin(losses))
-            spread = (max(losses) - min(losses)) / (sum(losses) / len(losses))
-            gated = spread < self._spread_gate
-            executed_idx = 0 if (self._shadow or gated) else best_idx
-            log.update(
-                active_goal=active,
-                current_energies={str(j): round(e, 5) for j, e in current_e.items()},
-                energies=[round(l, 6) for l in losses],
-                spread=round(spread, 5),
-                gated=bool(gated),
-                best_idx=best_idx,
-                executed_idx=executed_idx,
-                shadow=self._shadow,
-            )
-            if self._log_actions:
-                log["ee_pose0"] = np.round(result["states"][0, 0], 5).tolist()
-                log["cand_ee_actions"] = np.round(result["actions"], 5).tolist()
-            logging.info(
-                "subtask=%d spread=%.4f gated=%s best=%d exec=%d",
-                active, spread, gated, best_idx, executed_idx,
-            )
+                best_idx = int(np.argmin(losses))
+                spread = (max(losses) - min(losses)) / (sum(losses) / len(losses))
+                gated = spread < self._spread_gate
+                executed_idx = 0 if (self._shadow or gated) else best_idx
+                log.update(
+                    active_goal=active,
+                    current_energies={str(j): round(e, 5) for j, e in current_e.items()},
+                    energies=[round(l, 6) for l in losses],
+                    spread=round(spread, 5),
+                    gated=bool(gated),
+                    best_idx=best_idx,
+                    executed_idx=executed_idx,
+                )
+                if self._log_actions:
+                    log["ee_pose0"] = np.round(result["states"][0, 0], 5).tolist()
+                    log["cand_ee_actions"] = np.round(result["actions"], 5).tolist()
+                logging.info(
+                    "frontier=%s subtask=%d spread=%.4f gated=%s best=%d exec=%d",
+                    frontier, active, spread, gated, best_idx, executed_idx,
+                )
 
         outputs = {
             "state": inputs["state"][executed_idx][None, ...],
