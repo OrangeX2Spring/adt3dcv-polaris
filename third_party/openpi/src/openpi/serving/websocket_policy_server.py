@@ -32,7 +32,10 @@ class WebsocketPolicyServer:
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
-        asyncio.run(self.run())
+        try:
+            asyncio.run(self.run())
+        except KeyboardInterrupt:
+            logger.info("Policy server stopped.")
 
     async def run(self):
         async with _server.serve(
