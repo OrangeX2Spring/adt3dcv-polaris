@@ -1,0 +1,67 @@
+app: vjepa_droid
+folder: /workspace/polaris/runs/vjepa_foodbussing
+data:
+  batch_size: 1
+  camera_views:
+  - left_mp4_path
+  crop_size: 256
+  datasets:
+  - /workspace/polaris/runs/droid_foodbussing/dataset.csv
+  dataset_fpcs:
+  - 8
+  fps: 4
+  num_workers: 4
+  patch_size: 16
+  persistent_workers: true
+  pin_mem: true
+  stereo_view: false
+  tubelet_size: 2
+data_aug:
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 1.777
+  - 1.777
+  reprob: 0.0
+loss:
+  auto_steps: 2
+  loss_exp: 1.0
+  normalize_reps: true
+  reg_coeff: 0.0
+meta:
+  context_encoder_key: encoder
+  dtype: bfloat16
+  load_encoder: true
+  load_predictor: true
+  pretrain_checkpoint: /workspace/polaris/third_party/vjepa2/checkpoints/vjepa2-ac-vitg.pt
+  resume_checkpoint: null
+  save_every_freq: 5
+  seed: 239
+  target_encoder_key: encoder
+  use_sdpa: true
+model:
+  model_name: vit_giant_xformers
+  pred_depth: 24
+  pred_embed_dim: 1024
+  pred_is_frame_causal: true
+  pred_num_heads: 16
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_extrinsics: false
+  use_rope: true
+optimization:
+  anneal: 5
+  enc_lr_scale: 0.0
+  epochs: 20
+  final_lr: 0.0
+  final_weight_decay: 0.04
+  ipe: null
+  lr: 0.000005
+  predictor_only: true
+  start_lr: 0.000001
+  warmup: 2
+  weight_decay: 0.04

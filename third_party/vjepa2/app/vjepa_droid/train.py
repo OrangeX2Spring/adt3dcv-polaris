@@ -145,6 +145,7 @@ def main(args, resume_preempt=False):
     lr = cfgs_opt.get("lr")
     final_lr = cfgs_opt.get("final_lr")
     enc_lr_scale = cfgs_opt.get("enc_lr_scale", 1.0)
+    predictor_only = cfgs_opt.get("predictor_only", False)
     betas = cfgs_opt.get("betas", (0.9, 0.999))
     eps = cfgs_opt.get("eps", 1.0e-8)
     # ----------------------------------------------------------------------- #
@@ -210,12 +211,11 @@ def main(args, resume_preempt=False):
         use_rope=use_rope,
         use_activation_checkpointing=use_activation_checkpointing,
     )
-    target_encoder = copy.deepcopy(encoder)
+    target_encoder = encoder if predictor_only else copy.deepcopy(encoder)
 
     if compile_model:
-        logger.info("Compiling encoder, target_encoder, and predictor.")
+        logger.info("Compiling target encoder and predictor.")
         torch._dynamo.config.optimize_ddp = False
-        encoder.compile()
         target_encoder.compile()
         predictor.compile()
 
@@ -270,10 +270,16 @@ def main(args, resume_preempt=False):
         mixed_precision=mixed_precision,
         betas=betas,
         eps=eps,
+        predictor_only=predictor_only,
     )
-    encoder = DistributedDataParallel(encoder, static_graph=True)
+    if predictor_only:
+        target_encoder = DistributedDataParallel(target_encoder)
+        encoder = target_encoder
+        logger.info("Training predictor only; the frozen encoder is shared with the target encoder.")
+    else:
+        encoder = DistributedDataParallel(encoder, static_graph=True)
+        target_encoder = DistributedDataParallel(target_encoder)
     predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
-    target_encoder = DistributedDataParallel(target_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
 
@@ -518,7 +524,7 @@ def main(args, resume_preempt=False):
         # -- Save Last
         if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)
-            if save_every_freq > 0 and epoch % save_every_freq == 0:
-                save_every_file = f"e{epoch}.pt"
+            if save_every_freq > 0 and (epoch + 1) % save_every_freq == 0:
+                save_every_file = f"e{epoch + 1}.pt"
                 save_every_path = os.path.join(folder, save_every_file)
                 save_checkpoint(epoch + 1, save_every_path)

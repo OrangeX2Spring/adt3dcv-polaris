@@ -180,8 +180,8 @@ def init_video_model(
         use_activation_checkpointing=use_activation_checkpointing,
     )
 
-    encoder.to("cpu")
-    predictor.to("cpu")
+    encoder.to(device)
+    predictor.to(device)
     # logger.info(encoder)
     # logger.info(predictor)
 
@@ -211,20 +211,11 @@ def init_opt(
     eps=1e-8,
     zero_init_bias_wd=True,
     enc_lr_scale=1.0,
+    predictor_only=False,
 ):
-    param_groups = [
-        {
-            "params": (p for n, p in encoder.named_parameters() if ("bias" not in n) and (len(p.shape) != 1)),
-            "lr_scale": enc_lr_scale,
-        },
+    predictor_groups = [
         {
             "params": (p for n, p in predictor.named_parameters() if ("bias" not in n) and (len(p.shape) != 1)),
-        },
-        {
-            "params": (p for n, p in encoder.named_parameters() if ("bias" in n) or (len(p.shape) == 1)),
-            "WD_exclude": zero_init_bias_wd,
-            "weight_decay": 0,
-            "lr_scale": enc_lr_scale,
         },
         {
             "params": (p for n, p in predictor.named_parameters() if ("bias" in n) or (len(p.shape) == 1)),
@@ -232,6 +223,23 @@ def init_opt(
             "weight_decay": 0,
         },
     ]
+    if predictor_only:
+        param_groups = predictor_groups
+    else:
+        param_groups = [
+            {
+                "params": (p for n, p in encoder.named_parameters() if ("bias" not in n) and (len(p.shape) != 1)),
+                "lr_scale": enc_lr_scale,
+            },
+            predictor_groups[0],
+            {
+                "params": (p for n, p in encoder.named_parameters() if ("bias" in n) or (len(p.shape) == 1)),
+                "WD_exclude": zero_init_bias_wd,
+                "weight_decay": 0,
+                "lr_scale": enc_lr_scale,
+            },
+            predictor_groups[1],
+        ]
 
     optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)
     scheduler = WSDSchedule(

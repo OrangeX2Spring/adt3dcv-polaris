@@ -79,4 +79,38 @@ uv run python /workspace/polaris/experiments/expert_data/pack_droid.py \
 The packer validates required files, joint shape, finite values, and video/state length before
 writing `trajectory.h5`, `metadata.json`, `recordings/MP4/ext.mp4`, and `dataset.csv`.
 
-Before training, the final line should report `distinct ICs: 100`.
+For the current collection, the final line should report `49 episodes` and `distinct ICs: 49`.
+
+## 4. Adapt the V-JEPA2-AC predictor
+
+Stop Isaac Sim and the expert server first so this is the only process using the GPU. Install the
+small set of data-loader dependencies into the PolaRiS environment if they are not already present:
+
+```bash
+cd /workspace/polaris
+uv pip install --python .venv/bin/python pyyaml decord pandas h5py scipy timm einops iopath
+```
+
+The FoodBussing config initializes both networks from the trained `vjepa2-ac-vitg.pt` checkpoint,
+keeps the encoder frozen, and updates only the action-conditioned predictor. It uses one random
+8-frame clip from each episode per epoch, so 49 episodes and 20 epochs produce 980 optimizer steps.
+
+```bash
+cd /workspace/polaris/third_party/vjepa2
+/workspace/polaris/.venv/bin/python -m app.main \
+  --fname configs/train/vitg16/foodbussing-256px-8f.yaml \
+  --devices cuda:0
+```
+
+The run writes `latest.pt` plus snapshots at epochs 5, 10, 15, and 20 under
+`/workspace/polaris/runs/vjepa_foodbussing/`. Rerunning the same command resumes from `latest.pt`.
+The original checkpoint is never overwritten.
+
+To load the adapted checkpoint in the verifier, set:
+
+```bash
+VJEPA_CHECKPOINT=/workspace/polaris/runs/vjepa_foodbussing/latest.pt
+```
+
+on the same command that starts the OpenPI policy server. If the variable is omitted, the verifier
+continues to load the original `vjepa2-ac-vitg.pt` checkpoint.

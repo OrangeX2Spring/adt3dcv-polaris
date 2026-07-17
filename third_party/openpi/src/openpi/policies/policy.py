@@ -88,12 +88,19 @@ class Policy(BasePolicy):
         self._encoder, self._predictor = torch.hub.load(
             "facebookresearch/vjepa2", "vjepa2_ac_vit_giant", pretrained=False
         )
-        ckpt = torch.load(
-            "/workspace/polaris/third_party/vjepa2/checkpoints/vjepa2-ac-vitg.pt", map_location="cpu"
-        )
+        vjepa_checkpoint = pathlib.Path(
+            os.environ.get(
+                "VJEPA_CHECKPOINT",
+                "/workspace/polaris/third_party/vjepa2/checkpoints/vjepa2-ac-vitg.pt",
+            )
+        ).expanduser()
+        if not vjepa_checkpoint.is_file():
+            raise FileNotFoundError(f"V-JEPA checkpoint does not exist: {vjepa_checkpoint}")
+        ckpt = torch.load(vjepa_checkpoint, map_location="cpu")
         strip = lambda sd: {k.replace("module.", "", 1): v for k, v in sd.items()}
         self._encoder.load_state_dict(strip(ckpt["encoder"]))
         self._predictor.load_state_dict(strip(ckpt["predictor"]))
+        logging.info("Loaded V-JEPA checkpoint: %s", vjepa_checkpoint)
         self._encoder = self._encoder.to(self._vjepa_device).eval()
         self._predictor = self._predictor.to(self._vjepa_device).eval()
         crop_size = 256
