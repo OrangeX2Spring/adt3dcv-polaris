@@ -114,3 +114,25 @@ VJEPA_CHECKPOINT=/workspace/polaris/runs/vjepa_foodbussing/latest.pt
 
 on the same command that starts the OpenPI policy server. If the variable is omitted, the verifier
 continues to load the original `vjepa2-ac-vitg.pt` checkpoint.
+
+## 5. Test whether the predictor learned the actions
+
+Before another online verifier run, compare the recorded expert action against zero and nine
+cross-episode shuffled action chunks while keeping the visual context and robot states fixed. This
+uses the packed training trajectories directly and does not start Isaac Sim or the policy server.
+
+```bash
+cd /workspace/polaris
+/workspace/polaris/.venv/bin/python \
+  experiments/jepa_verifier/teacher_forced_action_test.py \
+  --checkpoint base=/workspace/polaris/third_party/vjepa2/checkpoints/vjepa2-ac-vitg.pt \
+  --checkpoint e10=/workspace/polaris/runs/vjepa_foodbussing/e10.pt \
+  --checkpoint e15=/workspace/polaris/runs/vjepa_foodbussing/e15.pt \
+  --checkpoint e20=/workspace/polaris/runs/vjepa_foodbussing/e20.pt \
+  --output /workspace/polaris/runs/vjepa_action_test
+```
+
+Each checkpoint writes `transitions.csv` and `summary.json` under
+`runs/vjepa_action_test/<label>/`. With nine shuffled negatives, random performance is AUC `0.5`,
+Top-1 `0.1`, and mean rank `5.5`. Inspect `first_transition` first because it is the clean
+one-step test with no earlier shuffled actions in the causal history.
